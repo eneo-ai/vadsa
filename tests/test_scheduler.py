@@ -1,5 +1,7 @@
 import asyncio
+import gc
 import threading
+import weakref
 from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
 
@@ -84,6 +86,33 @@ async def test_steps_and_windows_alternate_while_both_wait(
     await until(lambda: len(engine.calls) == 7)
     # batch progresses between steps; with only steps left they run back to back
     assert engine.calls == ["window", "step", "window", "step", "window", "step", "step"]
+
+
+async def test_a_cancelled_window_leaves_the_queue_and_one_on_the_gpu_finishes_first(
+    scheduler: Scheduler, engine: RecordingEngine
+) -> None:
+    running = asyncio.ensure_future(scheduler.transcribe(window()))
+    await until(lambda: engine.calls)
+    audio = window()
+    released = weakref.ref(audio)
+    queued = asyncio.ensure_future(scheduler.transcribe(audio))
+    await asyncio.sleep(0)  # its window is queued behind the running one
+    queued.cancel()
+    await asyncio.wait((queued,))
+    del audio, queued
+    gc.collect()
+    # the queue let go of the cancelled window's audio at once
+    assert released() is None
+
+    running.cancel()
+    await asyncio.sleep(0.1)
+    # the caller of a window on the GPU waits for it, so it never outlives the use of its audio
+    assert not running.done()
+    engine.gate.set()
+    await asyncio.wait((running,))
+    assert running.cancelled()
+    # the model never saw the cancelled window
+    assert engine.calls == ["window"]
 
 
 @pytest.mark.parametrize(

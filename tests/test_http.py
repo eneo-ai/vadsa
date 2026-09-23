@@ -1,3 +1,4 @@
+import asyncio
 import gc
 import json
 import tempfile
@@ -43,15 +44,22 @@ def form(*parts: bytes) -> bytes:
     return b"".join(parts) + f"--{BOUNDARY}--\r\n".encode()
 
 
-async def call(app: ASGIApp, body: list[bytes]) -> tuple[int, bytes]:
+async def call(
+    app: ASGIApp, body: list[bytes], leave: asyncio.Event | None = None
+) -> tuple[int, bytes]:
     """POST `body` to the transcription route straight through ASGI, one chunk per receive(),
-    then disconnect before the body is complete. Returns the status and the content; `body`
-    keeps the chunks the app never asked for."""
+    and return the status and the content; `body` keeps the chunks the app never asked for.
+
+    The client then disconnects: right after the last chunk, before the body is complete,
+    or, given `leave`, after a complete body once `leave` is set."""
     sent: list[Message] = []
 
     async def receive() -> Message:
         if body:
-            return {"type": "http.request", "body": body.pop(0), "more_body": True}
+            chunk = body.pop(0)
+            return {"type": "http.request", "body": chunk, "more_body": leave is None or bool(body)}
+        if leave is not None:
+            await leave.wait()
         return {"type": "http.disconnect"}
 
     async def send(message: Message) -> None:
@@ -332,3 +340,27 @@ def test_batch_requests_beyond_the_limit_get_503() -> None:
         engine.gate.set()
         thread.join()
         assert first[0].status_code == 200
+
+
+async def test_a_request_whose_client_leaves_while_its_window_waits_is_never_transcribed() -> None:
+    engine = GatedEngine()
+    with serve(engine) as client:
+        # the first request's window holds the GPU
+        first: list[httpx2.Response] = []
+        thread = threading.Thread(target=lambda: first.append(transcribe(client)))
+        thread.start()
+        await asyncio.to_thread(wait_until, lambda: engine.calls)
+        leave = asyncio.Event()
+        body = [form(part("model", MODEL), part("file", WAV, "a.wav"))]
+        second = asyncio.ensure_future(call(client.app, body, leave))
+        # the second request's window waits behind it when its client disconnects
+        await asyncio.to_thread(wait_until, lambda: client.app.state.scheduler._windows)
+        leave.set()
+        # it ends at once, without waiting for the GPU
+        status, _ = await asyncio.wait_for(second, 5)
+        assert status == 499
+        engine.gate.set()
+        await asyncio.to_thread(thread.join)
+    assert first[0].status_code == 200
+    # the model only ever saw the first request's window
+    assert engine.calls == ["window"]

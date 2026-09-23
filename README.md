@@ -73,7 +73,8 @@ as `text/plain`. Times are seconds from the start of the file. The upload is str
 temporary file, decoded with ffmpeg to 16 kHz mono and deleted before transcription starts.
 Audio longer than `VADSA_WINDOW_SECONDS` is transcribed in windows, each cut at the quietest
 200 ms in the 10 seconds before the window would end. If the client disconnects, the request
-stops before its next window.
+stops: a window still waiting for the GPU leaves the queue, one already on the GPU finishes
+first, and no further window is queued.
 
 Errors have the OpenAI shape, `{"error": {"message", "type", "param", "code"}}`:
 

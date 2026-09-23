@@ -18,7 +18,7 @@ import threading
 from collections import deque
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -56,7 +56,7 @@ class Stream:
     final: bool = False
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class _Window:
     audio: np.ndarray
     future: Future[Transcript]
@@ -155,12 +155,23 @@ class Scheduler:
                 self._batch_requests -= 1
 
     async def transcribe(self, audio: np.ndarray) -> Transcript:
-        """Decode one window; a request cancelled while it waits is skipped."""
+        """Decode one window. Cancelled while queued, the window leaves the queue at once;
+        cancelled on the GPU, it finishes first, so no caller outlives the use of its audio."""
         window = _Window(audio, Future())
         with self._lock:
             self._windows.append(window)
             self._lock.notify()
-        return await asyncio.wrap_future(window.future)
+        try:
+            return await asyncio.wrap_future(window.future)
+        except asyncio.CancelledError:
+            with self._lock:
+                if window in self._windows:
+                    self._windows.remove(window)
+            # a window already running on the GPU cannot be cancelled; wait until it is done
+            if not window.future.cancel():
+                with suppress(Exception):
+                    await asyncio.wrap_future(window.future)
+            raise
 
     # The GPU thread.
 

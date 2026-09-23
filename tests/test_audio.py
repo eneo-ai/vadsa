@@ -1,9 +1,13 @@
+import asyncio
 import itertools
+import os
+import signal
+from typing import Any
 
 import numpy as np
 import pytest
 
-from conftest import speech, wav_bytes
+from conftest import speech, wait_until, wav_bytes
 from vadsa import audio
 from vadsa.audio import SAMPLE_RATE
 
@@ -49,3 +53,28 @@ async def test_decode_refuses_audio_over_the_limit(tmp_path) -> None:
     path.write_bytes(wav_bytes(speech(3)))
     with pytest.raises(audio.AudioTooLong):
         await audio.decode(str(path), max_seconds=2)
+
+
+async def test_a_cancelled_decode_kills_and_reaps_ffmpeg(tmp_path, monkeypatch) -> None:
+    # ffmpeg waits on a pipe that nobody ever writes to
+    path = tmp_path / "never-written"
+    os.mkfifo(path)
+    started: list[asyncio.subprocess.Process] = []
+    create = asyncio.create_subprocess_exec
+
+    async def recorded(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+        started.append(await create(*args, **kwargs))
+        return started[-1]
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", recorded)
+    decoding = asyncio.ensure_future(audio.decode(str(path), max_seconds=10))
+    await asyncio.to_thread(wait_until, lambda: started)
+    try:
+        decoding.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await decoding
+        # killed, and its exit collected: no running ffmpeg and no zombie is left
+        assert started[0].returncode == -signal.SIGKILL
+    finally:
+        if started[0].returncode is None:  # only a regression leaves it running
+            started[0].kill()

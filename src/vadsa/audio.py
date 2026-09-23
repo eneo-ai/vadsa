@@ -21,7 +21,8 @@ async def decode(path: str, max_seconds: float) -> np.ndarray:
     """Decode any file ffmpeg reads to 16 kHz mono float32.
 
     ffmpeg stops one second past the limit, so an over-long file is refused without
-    decoding all of it."""
+    decoding all of it. Cancelled or failing, decode kills and reaps ffmpeg before it
+    returns."""
     process = await asyncio.create_subprocess_exec(
         "ffmpeg",
         "-nostdin",
@@ -43,7 +44,13 @@ async def decode(path: str, max_seconds: float) -> np.ndarray:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
     )
-    output, _ = await process.communicate()
+    try:
+        output, _ = await process.communicate()
+    finally:
+        if process.returncode is None:
+            process.kill()
+            # reading to the end closes the pipe, which the wait for the exit needs
+            await process.communicate()
     if process.returncode != 0 or not output:
         raise InvalidAudio
     audio = np.frombuffer(output, dtype="<f4")

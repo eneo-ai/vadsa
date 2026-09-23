@@ -1,6 +1,8 @@
 """POST /v1/audio/transcriptions: OpenAI multipart in, an OpenAI transcription out."""
 
+import asyncio
 import tempfile
+from collections.abc import Awaitable
 from typing import IO, Literal
 
 import numpy as np
@@ -133,10 +135,11 @@ async def _transcribe(request: Request, settings: Settings, scheduler: Scheduler
     parts = []
     window_samples = int(settings.window_seconds * audio.SAMPLE_RATE)
     for start, end in audio.windows(samples, window_samples):
+        # a client that left while its audio was decoded gets no window queued
         if await request.is_disconnected():
-            # nginx's "client closed request"; nobody is left to read it
-            return Response(status_code=499)
-        parts.append((start / audio.SAMPLE_RATE, await scheduler.transcribe(samples[start:end])))
+            raise ClientDisconnect
+        window = scheduler.transcribe(samples[start:end])
+        parts.append((start / audio.SAMPLE_RATE, await _unless_disconnected(request, window)))
     transcript = _join(parts)
 
     if response_format == "text":
@@ -159,6 +162,29 @@ async def _transcribe(request: Request, settings: Settings, scheduler: Scheduler
             for w in transcript.words
         ]
     return JSONResponse(verbose.model_dump(exclude_none=True))
+
+
+async def _unless_disconnected(request: Request, window: Awaitable[Transcript]) -> Transcript:
+    """The window's transcript, or ClientDisconnect once the client has gone. The scheduler
+    takes a cancelled window off its queue, or lets it finish on the GPU, before this raises,
+    so the request keeps its admission slot until its audio is let go."""
+    work = asyncio.ensure_future(window)
+    gone = asyncio.ensure_future(_disconnected(request))
+    try:
+        await asyncio.wait((work, gone), return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        gone.cancel()
+        work.cancel()
+        await asyncio.wait((work,))
+    if work.cancelled():
+        raise ClientDisconnect
+    return work.result()
+
+
+async def _disconnected(request: Request) -> None:
+    # once the body is read, receive() answers when the client has gone
+    while (await request.receive())["type"] != "http.disconnect":
+        pass
 
 
 async def _receive_form(
