@@ -1,0 +1,43 @@
+# vadsa on an NVIDIA GPU host. The same file works with `docker compose` and with
+# `podman compose` (podman-compose 1.5 turns the GPU reservation below into the CDI
+# device nvidia.com/gpu=all; see the README for the one-time CDI setup).
+#
+#   cp .env.example .env    # then set VADSA_API_KEYS
+#   docker compose up -d
+services:
+  vadsa:
+    # published images: ghcr.io/eneo-ai/vadsa:<tag> (CUDA) and <tag>-cpu
+    image: ghcr.io/eneo-ai/vadsa:${VADSA_VERSION:-latest}
+    build: .
+    env_file: .env
+    ports:
+      # Loopback only. Set VADSA_BIND to a private address when a consumer on another
+      # host needs it, or use compose.eneo.yaml to reach it over a shared network.
+      - "${VADSA_BIND:-127.0.0.1}:${VADSA_PORT:-8000}:8000"
+    volumes:
+      - models:/models
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      # NeMo unpacks the 2.5 GB checkpoint here while loading, and uploads wait here while
+      # ffmpeg decodes them (at most VADSA_MAX_BATCH_REQUESTS x VADSA_MAX_UPLOAD_BYTES)
+      - /tmp:size=4g,mode=1777
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "5"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  models:

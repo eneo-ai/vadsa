@@ -1,0 +1,17 @@
+# Optional: attach vadsa to a shared network so Eneo or Vemsa reach it by container name,
+# http://vadsa:8000, instead of through a published host port.
+#
+#   docker network create eneo-shared        # once, or reuse the consumer's network
+#   docker compose -f compose.yaml -f compose.eneo.yaml up -d
+#
+# Override the network name with VADSA_SHARED_NETWORK.
+services:
+  vadsa:
+    networks:
+      - default
+      - shared
+
+networks:
+  shared:
+    name: ${VADSA_SHARED_NETWORK:-eneo-shared}
+    external: true
