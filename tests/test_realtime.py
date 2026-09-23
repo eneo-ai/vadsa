@@ -1,5 +1,6 @@
 import base64
 import re
+import threading
 import time
 from typing import Any
 
@@ -9,7 +10,7 @@ from fastapi.testclient import TestClient
 from starlette.testclient import WebSocketTestSession
 from starlette.websockets import WebSocketDisconnect
 
-from conftest import AUTH, MODEL, GatedEngine, serve, speech, wait_until
+from conftest import AUTH, MODEL, GatedEngine, serve, speech, transcribe, wait_until
 from vadsa.engine.fake import FakeEngine
 
 PATH = "/v1/realtime?intent=transcription"
@@ -43,6 +44,12 @@ def until_done(ws: WebSocketTestSession) -> list[dict[str, Any]]:
     while events[-1]["type"] != "transcription.done":
         events.append(ws.receive_json())
     return events
+
+
+def opens(client: TestClient) -> bool:
+    """Whether a new session gets a slot."""
+    with client.websocket_connect(PATH, headers=AUTH) as ws:
+        return ws.receive_json()["type"] == "session.created"
 
 
 def test_a_session_streams_deltas_then_done_in_vllm_shapes(client: TestClient) -> None:
@@ -115,6 +122,36 @@ def test_a_session_ends_at_its_time_limit() -> None:
             append(ws, speech(0.1))
             time.sleep(0.05)
         assert refusal(ws) == ("session_too_long", 1000)
+
+
+@pytest.mark.parametrize(
+    ("ending", "max_session_seconds"),
+    [("disconnect", 60), ("time limit", 0.5)],
+    ids=["disconnect", "time-limit"],
+)
+def test_a_session_waiting_for_its_last_text_still_ends(
+    ending: str, max_session_seconds: float
+) -> None:
+    engine = GatedEngine()
+    with serve(engine, max_sessions=1, max_session_seconds=max_session_seconds) as client:
+        # a transcription holds the GPU, so the text is still due after the final commit
+        batch = threading.Thread(target=transcribe, args=(client,))
+        batch.start()
+        wait_until(lambda: engine.calls)
+        with client.websocket_connect(PATH, headers=AUTH) as ws:
+            start(ws)
+            append(ws, speech(2.5))
+            ws.send_json({"type": "input_audio_buffer.commit", "final": True})
+            if ending == "disconnect":
+                ws.close()
+            # the ended session drops its stream, which frees its slot
+            wait_until(lambda: opens(client))
+            if ending == "time limit":
+                assert refusal(ws) == ("session_too_long", 1000)
+        engine.gate.set()
+        batch.join()
+    # none of the ended session's audio reached the model
+    assert engine.calls == ["window"]
 
 
 def test_a_session_whose_audio_outruns_the_gpu_is_ended() -> None:

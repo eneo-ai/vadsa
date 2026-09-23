@@ -25,7 +25,9 @@ as `?intent=transcription` is accepted and ignored.
    audio. The server sends `transcription.delta` events as text is decoded.
 4. The client sends `input_audio_buffer.commit` with `"final": true` when the audio ends.
    The server decodes what is left, sends the remaining deltas, then
-   `transcription.done`, and closes the connection with code 1000.
+   `transcription.done`, and closes the connection with code 1000. Until then it still
+   reads the connection and ignores any further events; a disconnect or
+   `VADSA_MAX_SESSION_SECONDS` ends the session and drops what was not yet decoded.
 
 Audio is 16 kHz mono PCM16, little endian, base64 encoded. The server decodes it in frames
 of about one second (1.04 s with the default settings, the requested
@@ -46,7 +48,7 @@ transcription endpoint had it.
 | --- | --- | --- |
 | `session.update` | `model` | Must be the served model name. |
 | `input_audio_buffer.append` | `audio` | Base64 PCM16 LE mono 16 kHz, at most 1 MiB of audio per event. |
-| `input_audio_buffer.commit` | `final` (default `false`) | `true` ends the audio. Without it the event has no effect. |
+| `input_audio_buffer.commit` | `final` (default `false`) | `true` ends the audio; events after it are ignored. Without it the event has no effect. |
 
 ## Server events
 
@@ -76,7 +78,7 @@ an error.
 | `falling_behind` | 1013 | More than `VADSA_MAX_PENDING_SECONDS` of the session's audio waits for the GPU. |
 | `internal_error` | 1011 | Decoding failed on the server. |
 | `session_too_long` | 1000 | The session has been open for `VADSA_MAX_SESSION_SECONDS`. |
-| `idle_timeout` | 1000 | No append arrived for `VADSA_IDLE_TIMEOUT_SECONDS`. |
+| `idle_timeout` | 1000 | No append arrived for `VADSA_IDLE_TIMEOUT_SECONDS` before the final commit. |
 
 Close code 1013 means try again later. A client that disconnects, or a session that ends
 with an error, loses the audio that was not yet decoded; nothing is kept on the server.

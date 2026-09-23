@@ -7,6 +7,7 @@ import asyncio
 import base64
 import json
 import logging
+import math
 import time
 import uuid
 from contextlib import suppress
@@ -96,14 +97,16 @@ async def _run(
     events: asyncio.Queue[StreamEvent],
     settings: Settings,
 ) -> str:
-    """Relay client events and the stream's text until the final commit is decoded.
+    """Relay client events and the stream's text until the final commit is decoded, or the
+    client, a limit or a failure ends the session first.
 
     Plain asyncio.wait rather than a TaskGroup or gather: those can replace or swallow the
     CancelledError of a session that is being cancelled."""
     receiver = asyncio.create_task(_receive(websocket, scheduler, stream, settings))
     sender = asyncio.create_task(_send_deltas(websocket, events))
     try:
-        await asyncio.wait((receiver, sender), return_when=asyncio.FIRST_EXCEPTION)
+        # the receiver only ever ends with an error, the sender with the text or an error
+        await asyncio.wait((receiver, sender), return_when=asyncio.FIRST_COMPLETED)
     finally:
         receiver.cancel()
         sender.cancel()
@@ -118,10 +121,12 @@ async def _run(
 async def _receive(
     websocket: WebSocket, scheduler: Scheduler, stream: Stream, settings: Settings
 ) -> None:
-    """Client events up to and including the final commit."""
+    """Client events until the session ends. After the final commit the socket is still
+    read, so a disconnect or the time limit ends a session whose last text is pending."""
     loop = asyncio.get_running_loop()
     session_ends = loop.time() + settings.max_session_seconds
     idle_ends = loop.time() + settings.idle_timeout_seconds
+    audio_ended = False
     while True:
         message = None
         with suppress(TimeoutError):
@@ -133,6 +138,8 @@ async def _receive(
             raise SessionEnd(1000, "idle_timeout", "No audio arrived in time.")
         if message["type"] == "websocket.disconnect":
             raise WebSocketDisconnect(message.get("code", 1000))
+        if audio_ended:
+            continue
 
         event = _parse(message.get("text"))
         match event.get("type"):
@@ -150,7 +157,8 @@ async def _receive(
                     raise SessionEnd(1008, "invalid_event", "`final` must be true or false.")
                 if final:
                     scheduler.finish(stream)
-                    return
+                    # later events change nothing, and waiting for the text is not idling
+                    audio_ended, idle_ends = True, math.inf
                 # vLLM clients commit once before streaming; audio is decoded as it arrives
             case "session.update":
                 model = event.get("model")
