@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
+from vadsa.audio import SAMPLE_RATE
 from vadsa.config import Settings
 from vadsa.engine.base import Frame, Segment, Transcript, Word
 
@@ -15,6 +16,10 @@ CONFIG = Path(__file__).parent.parent / "conf" / "buffered_tdt.yaml"
 
 
 class NemoEngine:
+    # Buffered streaming lost the first word of a recording that opens with speech;
+    # half a second of silence ahead of it keeps the word.
+    lead_in_samples = SAMPLE_RATE // 2
+
     def __init__(self, settings: Settings) -> None:
         import torch
         from nemo.collections.asr.inference.factory.pipeline_builder import PipelineBuilder

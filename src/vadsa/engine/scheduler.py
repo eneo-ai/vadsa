@@ -19,7 +19,7 @@ from collections import deque
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -49,8 +49,8 @@ class FallingBehind(Exception):
 class Stream:
     id: int
     deliver: Callable[[StreamEvent], None]
-    # samples not yet sent to the engine
-    audio: np.ndarray = field(default_factory=lambda: np.zeros(0, np.float32))
+    # samples not yet sent to the engine, starting with the engine's lead-in of silence
+    audio: np.ndarray
     # a frame reached the engine, so the engine holds state for this id
     started: bool = False
     final: bool = False
@@ -109,7 +109,8 @@ class Scheduler:
             # a discarded stream keeps its slot until its engine state is cleared
             if len(self._streams) + len(self._discarded) >= self._max_sessions:
                 raise AtCapacity
-            stream = Stream(next(self._ids), deliver)
+            silence = np.zeros(self._engine.lead_in_samples, np.float32)
+            stream = Stream(next(self._ids), deliver, silence)
             self._streams[stream.id] = stream
             return stream
 

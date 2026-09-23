@@ -144,6 +144,21 @@ async def test_final_commit_sends_what_is_left_as_the_last_frame(
     assert events[-1] is None and engine.streams == {}
 
 
+async def test_a_new_stream_starts_with_the_engines_lead_in_of_silence(
+    scheduler: Scheduler, engine: RecordingEngine
+) -> None:
+    engine.lead_in_samples = FRAME // 2
+    engine.gate.set()
+    events: list[object] = []
+    stream = scheduler.open_stream(events.append)
+    scheduler.append(stream, np.full(FRAME, 0.5, np.float32))
+    scheduler.finish(stream)
+    await until(lambda: None in events)
+    received = np.concatenate([frame.samples[: frame.length] for frame in engine.frames])
+    lead_in = np.zeros(FRAME // 2, np.float32)
+    assert np.array_equal(received, np.concatenate((lead_in, np.full(FRAME, 0.5, np.float32))))
+
+
 async def test_a_discarded_stream_holds_its_slot_until_its_state_is_cleared(
     scheduler: Scheduler, engine: RecordingEngine
 ) -> None:

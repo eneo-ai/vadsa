@@ -39,10 +39,12 @@ is transcribed, a step can wait for one whole transcription window.
 
 Deltas only append: text that has been sent is never revised. Joined together they equal
 the `text` of `transcription.done`. The text is a preview; the transcription endpoint
-decodes a recording with the whole recording as context and is the better transcript. In a
-test on CPU with the default sizes, the preview missed a session's first word, spoken in
-its first half second. NeMo's own streaming run of the same file missed it too, while the
-transcription endpoint had it.
+decodes a recording with the whole recording as context and is the better transcript.
+
+Each session's audio starts with half a second of silence that the server adds. In a test
+on CPU with the default sizes, NeMo's streaming lost the first word of a recording that
+opens with speech; with the silence ahead of it, the preview of that recording had the same
+text as the transcription endpoint.
 
 ## Client events
 

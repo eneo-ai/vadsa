@@ -16,6 +16,8 @@ class FakeEngine:
     Word n is "ordn". Streaming keeps a frame count per open stream, like the state a
     real pipeline keeps, so tests can see it created, finished and discarded."""
 
+    lead_in_samples = 0
+
     def __init__(self, frame_samples: int = SAMPLE_RATE) -> None:
         self.frame_samples = frame_samples
         self.streams: dict[int, int] = {}
