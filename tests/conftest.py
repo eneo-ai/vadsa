@@ -1,11 +1,23 @@
 import io
+import threading
 import time
 import wave
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 
 import numpy as np
+import pytest
+from fastapi.testclient import TestClient
 
 from vadsa.audio import SAMPLE_RATE
+from vadsa.config import Settings
+from vadsa.engine.base import Engine, Frame, Transcript
+from vadsa.engine.fake import FakeEngine
+from vadsa.main import create_app
+
+KEY = "test-key"
+MODEL = "KlangAI/pianissimo-sv"
+AUTH = {"Authorization": f"Bearer {KEY}"}
 
 
 def speech(seconds: float, silent: tuple[float, float] | None = None) -> np.ndarray:
@@ -32,3 +44,46 @@ def wait_until(condition: Callable[[], bool], timeout: float = 5) -> None:
     while not condition():
         assert time.monotonic() < deadline, "timed out"
         time.sleep(0.01)
+
+
+class GatedEngine(FakeEngine):
+    """A fake engine that holds the GPU thread in every call until `gate` opens."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate = threading.Event()
+        self.calls: list[str] = []
+
+    def step(self, frames: list[Frame]) -> list[str]:
+        self.calls.append("step")
+        self.gate.wait()
+        return super().step(frames)
+
+    def transcribe(self, audio: np.ndarray) -> Transcript:
+        self.calls.append("window")
+        self.gate.wait()
+        return super().transcribe(audio)
+
+
+@contextmanager
+def serve(engine: Engine | None = None, **overrides: object) -> Iterator[TestClient]:
+    """A running app on the fake engine, with test keys and any setting overridden."""
+    loaded = engine or FakeEngine()
+    settings = Settings(
+        **{"environment": "development", "engine": "fake", "api_keys": KEY} | overrides
+    )
+    app = create_app(settings, load_engine=lambda: loaded)
+    with TestClient(app) as client:
+        try:
+            wait_until(lambda: app.state.scheduler.ready)
+            yield client
+        finally:
+            # let a held GPU thread finish so it can see the stop
+            if isinstance(loaded, GatedEngine):
+                loaded.gate.set()
+
+
+@pytest.fixture
+def client() -> Iterator[TestClient]:
+    with serve() as client:
+        yield client
