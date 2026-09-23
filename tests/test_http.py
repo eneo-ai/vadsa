@@ -1,31 +1,92 @@
+import gc
+import json
+import tempfile
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from pathlib import Path
 from typing import Any
 
 import httpx2
 import pytest
 from fastapi.testclient import TestClient
+from starlette.types import ASGIApp, Message
 from starlette.websockets import WebSocketDisconnect
 
-from conftest import AUTH, KEY, MODEL, GatedEngine, serve, speech, wait_until, wav_bytes
+from conftest import (
+    AUTH,
+    KEY,
+    MODEL,
+    GatedEngine,
+    serve,
+    speech,
+    transcribe,
+    wait_until,
+    wav_bytes,
+)
 from vadsa.config import Settings
 from vadsa.engine.fake import FakeEngine
 from vadsa.main import create_app
 
+BOUNDARY = "vadsa-boundary"
+HEADERS = AUTH | {"Content-Type": f"multipart/form-data; boundary={BOUNDARY}"}
+WAV = wav_bytes(speech(3))
 
-def transcribe(
-    client: TestClient,
-    audio: bytes | None = None,
-    headers: dict[str, str] = AUTH,
-    **fields: Any,
-) -> httpx2.Response:
-    upload = audio if audio is not None else wav_bytes(speech(3))
-    return client.post(
-        "/v1/audio/transcriptions",
-        data={"model": MODEL} | fields,
-        files={"file": ("speech.wav", upload, "audio/wav")},
-        headers=headers,
-    )
+
+def part(name: str, value: str | bytes, filename: str | None = None) -> bytes:
+    """One part of a multipart body; a file name makes it a file part."""
+    disposition = f'form-data; name="{name}"' + (f'; filename="{filename}"' if filename else "")
+    data = value.encode() if isinstance(value, str) else value
+    return f"--{BOUNDARY}\r\nContent-Disposition: {disposition}\r\n\r\n".encode() + data + b"\r\n"
+
+
+def form(*parts: bytes) -> bytes:
+    return b"".join(parts) + f"--{BOUNDARY}--\r\n".encode()
+
+
+async def call(app: ASGIApp, body: list[bytes]) -> tuple[int, bytes]:
+    """POST `body` to the transcription route straight through ASGI, one chunk per receive(),
+    then disconnect before the body is complete. Returns the status and the content; `body`
+    keeps the chunks the app never asked for."""
+    sent: list[Message] = []
+
+    async def receive() -> Message:
+        if body:
+            return {"type": "http.request", "body": body.pop(0), "more_body": True}
+        return {"type": "http.disconnect"}
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/audio/transcriptions",
+        "raw_path": b"/v1/audio/transcriptions",
+        "root_path": "",
+        "query_string": b"",
+        "headers": [(key.lower().encode(), value.encode()) for key, value in HEADERS.items()],
+        "client": ("127.0.0.1", 50000),
+        "server": ("testserver", 80),
+    }
+    await app(scope, receive, send)
+    return sent[0]["status"], b"".join(message.get("body", b"") for message in sent[1:])
+
+
+@pytest.fixture
+def uploads_left(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[Callable[[], list[Path]]]:
+    """The upload files still on disk. The cyclic collector is off, so a file is only gone
+    once the request itself has closed it."""
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    gc.disable()
+    try:
+        yield lambda: list(tmp_path.iterdir())
+    finally:
+        gc.enable()
 
 
 def error_of(response: httpx2.Response) -> tuple[int, str | None]:
@@ -168,16 +229,7 @@ def test_audio_over_the_duration_limit_is_refused() -> None:
 
 @pytest.mark.parametrize("chunked", [False, True], ids=["content-length", "chunked"])
 def test_uploads_over_the_size_limit_are_refused(chunked: bool) -> None:
-    boundary = "vadsa-boundary"
-    body = (
-        (
-            f'--{boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\n{MODEL}\r\n'
-            f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="a.wav"\r\n'
-            "Content-Type: audio/wav\r\n\r\n"
-        ).encode()
-        + wav_bytes(speech(3))
-        + f"\r\n--{boundary}--\r\n".encode()
-    )
+    body = form(part("model", MODEL), part("file", WAV, "a.wav"))
 
     def chunks() -> Iterator[bytes]:
         for start in range(0, len(body), 4096):
@@ -185,11 +237,73 @@ def test_uploads_over_the_size_limit_are_refused(chunked: bool) -> None:
 
     with serve(max_upload_bytes=50_000) as client:
         response = client.post(
-            "/v1/audio/transcriptions",
-            content=chunks() if chunked else body,
-            headers=AUTH | {"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            "/v1/audio/transcriptions", content=chunks() if chunked else body, headers=HEADERS
         )
         assert error_of(response) == (413, "file_too_large")
+
+
+@pytest.mark.parametrize(
+    ("body", "refused_after", "param"),
+    [
+        (
+            form(part("model", MODEL), part("file", WAV, "a.wav"), part("file", WAV, "b.wav")),
+            b'filename="b.wav"\r\n\r\n',
+            "file",
+        ),
+        (
+            form(part("model", MODEL), part("audio", WAV, "a.wav")),
+            b'filename="a.wav"\r\n\r\n',
+            "file",
+        ),
+        (
+            form(*(part(f"field{n}", "value") for n in range(33)), part("file", WAV, "a.wav")),
+            b'name="field32"\r\n\r\n',
+            None,
+        ),
+        (
+            form(part("prompt", "x" * (64 * 1024 + 1)), part("file", WAV, "a.wav")),
+            b"x" * (64 * 1024 + 1),
+            None,
+        ),
+    ],
+    ids=["second-file", "file-not-named-file", "33-fields", "field-bytes"],
+)
+async def test_a_form_beyond_its_bounds_is_refused_as_soon_as_it_crosses_them(
+    uploads_left: Callable[[], list[Path]], body: bytes, refused_after: bytes, param: str | None
+) -> None:
+    at = body.index(refused_after) + len(refused_after)
+    tail = body[at:]
+    chunks = [body[:at], tail]
+    with serve() as client:
+        status, content = await call(client.app, chunks)
+    assert status == 400
+    assert json.loads(content)["error"]["param"] == param
+    # the rest of the body was never read, and nothing it started is left
+    assert chunks == [tail]
+    assert uploads_left() == []
+
+
+async def test_a_client_that_disconnects_mid_upload_leaves_no_file(
+    uploads_left: Callable[[], list[Path]],
+) -> None:
+    body = form(part("model", MODEL), part("file", WAV, "a.wav"))
+    with serve() as client:
+        status, _ = await call(client.app, [body[: len(body) // 2]])
+    assert status == 499
+    assert uploads_left() == []
+
+
+def test_a_body_that_ends_before_its_closing_boundary_is_refused(
+    uploads_left: Callable[[], list[Path]],
+) -> None:
+    # complete `model` and `file` parts, then the body stops where another part would start
+    body = form(part("model", MODEL), part("file", WAV, "a.wav"))
+    truncated = body.removesuffix(f"--{BOUNDARY}--\r\n".encode()) + f"--{BOUNDARY}\r\n".encode()
+    with serve() as client:
+        response = client.post("/v1/audio/transcriptions", content=truncated, headers=HEADERS)
+    assert error_of(response) == (400, None)
+    assert response.json()["error"]["message"] == "The multipart body is malformed."
+    assert uploads_left() == []
 
 
 def test_long_audio_is_decoded_in_windows_with_times_offset() -> None:

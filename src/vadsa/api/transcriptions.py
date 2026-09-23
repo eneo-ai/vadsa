@@ -1,16 +1,16 @@
 """POST /v1/audio/transcriptions: OpenAI multipart in, an OpenAI transcription out."""
 
-import os
 import tempfile
-from typing import Literal
+from typing import IO, Literal
 
 import numpy as np
 from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
-from python_multipart import FormParser
-from python_multipart.exceptions import ParseError
-from python_multipart.multipart import Field, File, parse_options_header
+from python_multipart import MultipartParser
+from python_multipart.exceptions import FormParserError
+from python_multipart.multipart import parse_options_header
+from starlette.requests import ClientDisconnect
 
 from vadsa import audio
 from vadsa.auth import require_api_key
@@ -24,6 +24,9 @@ router = APIRouter()
 _RETRY_AFTER = {"Retry-After": "5"}
 _FORMATS = ("json", "text", "verbose_json")
 _GRANULARITIES = ("word", "segment")
+# the OpenAI form is a handful of short fields next to the file
+_MAX_FIELDS = 32
+_MAX_FIELD_BYTES = 64 * 1024
 
 
 class Transcription(BaseModel):
@@ -105,6 +108,9 @@ async def create_transcription(request: Request) -> Response:
     try:
         with scheduler.admit():
             return await _transcribe(request, settings, scheduler)
+    except ClientDisconnect:
+        # nginx's "client closed request"; nobody is left to read it
+        return Response(status_code=499)
     except ModelLoading:
         raise ApiError(
             503, "The model is still loading.", code="model_loading", headers=_RETRY_AFTER
@@ -116,15 +122,13 @@ async def create_transcription(request: Request) -> Response:
 
 
 async def _transcribe(request: Request, settings: Settings, scheduler: Scheduler) -> Response:
-    fields, upload = await _receive_form(request, settings.max_upload_bytes)
-    try:
+    # leaving the block deletes the upload, however the request ends
+    with tempfile.NamedTemporaryFile() as upload:
+        fields, has_file = await _receive_form(request, settings.max_upload_bytes, upload)
         response_format, granularities = _read_options(fields, settings)
-        if upload is None:
+        if not has_file:
             raise ApiError(400, "Attach the audio as the `file` field.", param="file")
-        samples = await _decode(upload, settings.max_audio_seconds)
-    finally:
-        if upload is not None:
-            upload.close()
+        samples = await _decode(upload.name, settings.max_audio_seconds)
 
     parts = []
     window_samples = int(settings.window_seconds * audio.SAMPLE_RATE)
@@ -158,9 +162,12 @@ async def _transcribe(request: Request, settings: Settings, scheduler: Scheduler
 
 
 async def _receive_form(
-    request: Request, max_bytes: int
-) -> tuple[dict[str, list[str]], File | None]:
-    """Stream the multipart body; the `file` part goes straight to a temp file."""
+    request: Request, max_bytes: int, upload: IO[bytes]
+) -> tuple[dict[str, list[str]], bool]:
+    """Stream the multipart body: the `file` part into `upload`, the other fields into memory.
+
+    One file part is taken and the fields are bounded while they arrive; a body is whole only
+    at its closing boundary. Returns the fields and whether the file arrived."""
     content_type, params = parse_options_header(request.headers.get("content-type"))
     if content_type != b"multipart/form-data" or b"boundary" not in params:
         raise ApiError(400, "Send the request as multipart/form-data.")
@@ -169,48 +176,97 @@ async def _receive_form(
     )
     if int(request.headers.get("content-length", 0)) > max_bytes:
         raise too_large
+    malformed = ApiError(400, "The multipart body is malformed.")
+    fields_over_limit = ApiError(
+        400,
+        f"The form takes at most {_MAX_FIELDS} fields besides the file, "
+        f"of {_MAX_FIELD_BYTES} bytes together.",
+    )
 
     fields: dict[str, list[str]] = {}
-    files: list[File] = []
+    field_count = field_bytes = 0
+    header_name, header_value = bytearray(), bytearray()
+    disposition = b""
+    # the field being read, or None while the file is
+    field: tuple[str, bytearray] | None = None
+    has_file = ended = False
 
-    def on_field(field: Field) -> None:
-        name = field.field_name.decode("utf-8", "replace")
-        fields.setdefault(name, []).append((field.value or b"").decode("utf-8", "replace"))
+    def on_header_field(data: bytes, start: int, end: int) -> None:
+        header_name.extend(data[start:end])
 
-    parser = FormParser(
-        "multipart/form-data",
-        on_field,
-        files.append,
-        boundary=params[b"boundary"],
-        config={"UPLOAD_DIR": tempfile.gettempdir(), "MAX_MEMORY_FILE_SIZE": 0},
-    )
+    def on_header_value(data: bytes, start: int, end: int) -> None:
+        header_value.extend(data[start:end])
+
+    def on_header_end() -> None:
+        nonlocal disposition
+        if header_name.lower() == b"content-disposition":
+            disposition = bytes(header_value)
+        header_name.clear()
+        header_value.clear()
+
+    def on_headers_finished() -> None:
+        nonlocal disposition, field, field_count, has_file
+        _, options = parse_options_header(disposition)
+        disposition = b""
+        name = options.get(b"name")
+        if name is None:
+            raise malformed
+        if b"filename" in options:
+            # any file part but the first `file` is refused as soon as it starts
+            if has_file or name != b"file":
+                raise ApiError(400, "Attach one file, as the `file` field.", param="file")
+            has_file, field = True, None
+            return
+        field_count += 1
+        if field_count > _MAX_FIELDS:
+            raise fields_over_limit
+        field = (name.decode("utf-8", "replace"), bytearray())
+
+    def on_part_data(data: bytes, start: int, end: int) -> None:
+        nonlocal field_bytes
+        if field is None:
+            upload.write(data[start:end])
+            return
+        field_bytes += end - start
+        if field_bytes > _MAX_FIELD_BYTES:
+            raise fields_over_limit
+        field[1].extend(data[start:end])
+
+    def on_part_end() -> None:
+        if field is not None:
+            name, value = field
+            fields.setdefault(name, []).append(value.decode("utf-8", "replace"))
+
+    def on_end() -> None:
+        nonlocal ended
+        ended = True
+
     received = 0
     try:
+        parser = MultipartParser(
+            params[b"boundary"],
+            {
+                "on_header_field": on_header_field,
+                "on_header_value": on_header_value,
+                "on_header_end": on_header_end,
+                "on_headers_finished": on_headers_finished,
+                "on_part_data": on_part_data,
+                "on_part_end": on_part_end,
+                "on_end": on_end,
+            },
+        )
         async for chunk in request.stream():
             received += len(chunk)
             if received > max_bytes:
                 raise too_large
             parser.write(chunk)
-        parser.finalize()
-    except ParseError:
-        _close(files)
-        raise ApiError(400, "The multipart body is malformed.") from None
-    except BaseException:
-        _close(files)
-        raise
-
-    upload = None
-    for file in files:
-        if file.field_name == b"file" and upload is None:
-            upload = file
-        else:
-            file.close()
-    return fields, upload
-
-
-def _close(files: list[File]) -> None:
-    for file in files:
-        file.close()
+    except FormParserError:
+        raise malformed from None
+    # the parser accepts a body that stops early; only the closing boundary ends it
+    if not ended:
+        raise malformed
+    upload.flush()
+    return fields, has_file
 
 
 def _read_options(fields: dict[str, list[str]], settings: Settings) -> tuple[str, set[str]]:
@@ -245,12 +301,9 @@ def _read_options(fields: dict[str, list[str]], settings: Settings) -> tuple[str
     return response_format, granularities
 
 
-async def _decode(upload: File, max_seconds: float) -> np.ndarray:
+async def _decode(path: str, max_seconds: float) -> np.ndarray:
     try:
-        # an empty upload never leaves memory, so it has no file name
-        if upload.actual_file_name is None:
-            raise audio.InvalidAudio
-        return await audio.decode(os.fsdecode(upload.actual_file_name), max_seconds)
+        return await audio.decode(path, max_seconds)
     except audio.InvalidAudio:
         raise ApiError(
             400, "The file is not audio ffmpeg can decode.", code="invalid_audio", param="file"

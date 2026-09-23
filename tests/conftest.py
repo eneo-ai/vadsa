@@ -4,7 +4,9 @@ import time
 import wave
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from typing import Any
 
+import httpx2
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
@@ -37,6 +39,21 @@ def wav_bytes(samples: np.ndarray, sample_rate: int = SAMPLE_RATE) -> bytes:
         out.setframerate(sample_rate)
         out.writeframes((samples * 32767).astype("<i2").tobytes())
     return buffer.getvalue()
+
+
+def transcribe(
+    client: TestClient,
+    audio: bytes | None = None,
+    headers: dict[str, str] = AUTH,
+    **fields: Any,
+) -> httpx2.Response:
+    upload = audio if audio is not None else wav_bytes(speech(3))
+    return client.post(
+        "/v1/audio/transcriptions",
+        data={"model": MODEL} | fields,
+        files={"file": ("speech.wav", upload, "audio/wav")},
+        headers=headers,
+    )
 
 
 def wait_until(condition: Callable[[], bool], timeout: float = 5) -> None:

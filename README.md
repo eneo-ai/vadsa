@@ -44,6 +44,9 @@ curl -s http://127.0.0.1:8000/v1/models -H "Authorization: Bearer $VADSA_KEY"
 - `prompt` and `temperature` are accepted for compatibility and ignored: the model takes no
   prompt and decoding is greedy.
 
+The form carries one file and at most 32 other fields of 64 KiB together; fields not listed
+here are ignored.
+
 ```bash
 curl -s http://127.0.0.1:8000/v1/audio/transcriptions \
   -H "Authorization: Bearer $VADSA_KEY" \
@@ -80,7 +83,7 @@ Errors have the OpenAI shape, `{"error": {"message", "type", "param", "code"}}`:
 | 400 | `audio_too_long` | The audio is longer than `VADSA_MAX_AUDIO_SECONDS` |
 | 400 | `unsupported_language` | `language` is not `sv` or `auto` |
 | 400 | `unsupported_response_format` | `response_format` is not `json`, `text` or `verbose_json` |
-| 400 | `null` | No `file`, a malformed multipart body, or an unknown granularity |
+| 400 | `null` | No `file` or a second file, more fields than the form takes, a malformed multipart body or one without its closing boundary, or an unknown granularity |
 | 401 | `invalid_api_key` | The key is missing or wrong |
 | 404 | `model_not_found` | `model` is not the served name |
 | 413 | `file_too_large` | The upload is larger than `VADSA_MAX_UPLOAD_BYTES` |
