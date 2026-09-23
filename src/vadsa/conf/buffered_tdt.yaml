@@ -1,0 +1,83 @@
+# Buffered streaming for KlangAI/pianissimo-sv (FastConformer, TDT decoder) on NeMo 3.0.0.
+#
+# Adapted from NVIDIA NeMo examples/asr/conf/asr_streaming_inference/buffered_rnnt.yaml
+# at v3.0.0, Copyright (c) 2025 NVIDIA CORPORATION, licensed under the Apache License,
+# Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0). Changes: frame requests,
+# stateful decoding with the tail result, the pipeline's batch size, vadsa's model and
+# window sizes, and the example script's own settings (NMT, metrics, file paths) removed.
+#
+# vadsa overwrites asr.model_name, asr.device and the three streaming sizes from its
+# settings when it builds the pipeline.
+
+asr:
+  model_name: KlangAI/pianissimo-sv
+  device: cuda
+  device_id: 0
+  compute_dtype: bfloat16
+  use_amp: false
+  decoding:
+    strategy: "greedy_batch"
+    preserve_alignments: false
+    fused_batch_size: -1
+    greedy:
+      use_cuda_graph_decoder: true
+      enable_per_stream_biasing: true
+      preserve_frame_confidence: false
+      max_symbols: 10
+      ngram_lm_model: null
+      ngram_lm_alpha: 0.0
+      boosting_tree:
+        model_path: null
+        key_phrases_file: null
+        key_phrases_list: null
+        key_phrase_items_list: null
+        source_lang: "en"
+      boosting_tree_alpha: 0.0
+
+# read when the pipeline is built even though inverse text normalization is off
+itn:
+  input_case: lower_cased
+  whitelist: null
+  overwrite_cache: false
+  max_number_of_permutations_per_split: 729
+  left_padding_size: 4
+  batch_size: 32
+  n_jobs: 16
+
+confidence:
+  exclude_blank: true
+  aggregation: mean
+  method_cfg:
+    name: entropy
+    entropy_type: tsallis
+    alpha: 0.5
+    entropy_norm: exp
+
+endpointing:
+  stop_history_eou: 800
+  residue_tokens_at_end: 2
+
+streaming:
+  sample_rate: 16000
+  # streams decoded together in one step; more ready streams take further batches
+  batch_size: 32
+  left_padding_size: 6.0
+  right_padding_size: 1.0
+  chunk_size: 1.0
+  word_boundary_tolerance: 4
+  request_type: frame
+  stateful: true
+  padding_mode: right
+
+matmul_precision: high
+log_level: 20
+pipeline_type: buffered
+asr_decoding_type: rnnt
+
+enable_itn: false
+enable_nmt: false
+asr_output_granularity: segment
+cache_dir: null
+lang: null
+# decode the audio left in the right padding when a stream's last frame arrives
+return_tail_result: true
