@@ -159,6 +159,39 @@ async def test_a_new_stream_starts_with_the_engines_lead_in_of_silence(
     assert np.array_equal(received, np.concatenate((lead_in, np.full(FRAME, 0.5, np.float32))))
 
 
+@pytest.mark.parametrize("appended", [None, 0], ids=["no-append", "empty-append"])
+async def test_an_empty_session_ends_at_once_without_the_gpu_despite_a_lead_in(
+    scheduler: Scheduler, engine: RecordingEngine, appended: int | None
+) -> None:
+    engine.lead_in_samples = FRAME // 2
+    busy = asyncio.ensure_future(scheduler.transcribe(window()))
+    await until(lambda: engine.calls)  # a window holds the GPU
+    events: list[object] = []
+    stream = scheduler.open_stream(events.append)
+    if appended is not None:
+        scheduler.append(stream, np.zeros(appended, np.float32))
+    scheduler.finish(stream)
+    # done while the GPU is still busy: the lead-in alone is not audio to decode
+    assert events == [None]
+    engine.gate.set()
+    await busy
+    await asyncio.sleep(0.05)
+    assert engine.calls == ["window"]
+
+
+async def test_the_gpu_thread_lets_go_of_a_finished_window_while_it_waits(
+    scheduler: Scheduler, engine: RecordingEngine
+) -> None:
+    engine.gate.set()
+    audio = window()
+    released = weakref.ref(audio)
+    await scheduler.transcribe(audio)
+    del audio
+    await asyncio.sleep(0.05)  # the GPU thread is back to waiting for work
+    gc.collect()
+    assert released() is None
+
+
 async def test_a_discarded_stream_holds_its_slot_until_its_state_is_cleared(
     scheduler: Scheduler, engine: RecordingEngine
 ) -> None:

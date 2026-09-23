@@ -46,7 +46,7 @@ class Engine(Protocol):
 
     # samples per streaming frame, as the model decodes them
     frame_samples: int
-    # silence every new stream starts with, for a model that needs some before speech
+    # silence put ahead of a stream's first audio, for a model that needs some before speech
     lead_in_samples: int
 
     def step(self, frames: list[Frame]) -> list[str]:

@@ -19,7 +19,7 @@ from collections import deque
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -49,8 +49,10 @@ class FallingBehind(Exception):
 class Stream:
     id: int
     deliver: Callable[[StreamEvent], None]
-    # samples not yet sent to the engine, starting with the engine's lead-in of silence
-    audio: np.ndarray
+    # samples not yet sent to the engine
+    audio: np.ndarray = field(default_factory=lambda: np.zeros(0, np.float32))
+    # the engine's lead-in of silence went in ahead of the first audio
+    led_in: bool = False
     # a frame reached the engine, so the engine holds state for this id
     started: bool = False
     final: bool = False
@@ -109,13 +111,17 @@ class Scheduler:
             # a discarded stream keeps its slot until its engine state is cleared
             if len(self._streams) + len(self._discarded) >= self._max_sessions:
                 raise AtCapacity
-            silence = np.zeros(self._engine.lead_in_samples, np.float32)
-            stream = Stream(next(self._ids), deliver, silence)
+            stream = Stream(next(self._ids), deliver)
             self._streams[stream.id] = stream
             return stream
 
     def append(self, stream: Stream, samples: np.ndarray) -> None:
         with self._lock:
+            if len(samples) and not stream.led_in and self._engine is not None:
+                # only real audio gets the lead-in, so an empty session ends at once
+                lead_in = np.zeros(self._engine.lead_in_samples, np.float32)
+                samples = np.concatenate((lead_in, samples))
+                stream.led_in = True
             stream.audio = np.concatenate((stream.audio, samples))
             if len(stream.audio) > self._max_pending_samples:
                 raise FallingBehind
@@ -193,6 +199,8 @@ class Scheduler:
                 self._decode(engine, work)
             else:
                 self._step(engine, work)
+            # a finished window may hold a whole decoded recording; drop it before waiting
+            del work
 
     def _next(self, engine: Engine) -> _Window | list[tuple[Stream, Frame]] | None:
         with self._lock:
