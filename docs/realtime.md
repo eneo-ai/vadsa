@@ -33,7 +33,9 @@ Audio is 16 kHz mono PCM16, little endian, base64 encoded. The server decodes it
 of about one second (1.04 s with the default settings, the requested
 `VADSA_STREAM_CHUNK_SECONDS` rounded up to whole 80 ms model frames). A frame is decoded
 once the next frame has started to arrive, with one more frame of audio after it as context
-(`VADSA_STREAM_RIGHT_PADDING_SECONDS`), so text trails speech by up to about two seconds.
+(`VADSA_STREAM_RIGHT_PADDING_SECONDS`). That buffering puts text about two seconds behind
+speech. The time a step waits for the GPU and takes to run comes on top; while a long file
+is transcribed, a step can wait for one whole transcription window.
 
 Deltas only append: text that has been sent is never revised. Joined together they equal
 the `text` of `transcription.done`. The text is a preview; the transcription endpoint

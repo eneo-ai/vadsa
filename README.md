@@ -96,12 +96,13 @@ Errors have the OpenAI shape, `{"error": {"message", "type", "param", "code"}}`:
 `GET /v1/realtime` takes base64 PCM16 audio at 16 kHz in `input_audio_buffer.append` events
 and sends `transcription.delta` events while the audio is decoded, then `transcription.done`
 after the client's final commit, and closes. The event shapes are vLLM's, so vLLM clients
-such as Eneo's live preview work unchanged. Deltas only ever append, and the text trails
-speech by up to about two seconds. It is a preview: the transcription endpoint sees the whole
-recording and gives the better transcript. Every refusal (a wrong key or model, too many
-sessions, a client sending audio faster than the GPU decodes it, a time limit) is an `error`
-event followed by a close. [`docs/realtime.md`](docs/realtime.md) has the event reference,
-the close codes and an example client.
+such as Eneo's live preview work unchanged. Deltas only ever append. The text trails speech by
+about two seconds of model buffering, plus the time each step waits for the GPU and takes to
+run. It is a preview: the transcription endpoint sees the whole recording and gives the better
+transcript. Every refusal (a wrong key or model, too many sessions, a client sending audio
+faster than the GPU decodes it, a time limit) is an `error` event followed by a close.
+[`docs/realtime.md`](docs/realtime.md) has the event reference, the close codes and an example
+client.
 
 ## Configuration
 
