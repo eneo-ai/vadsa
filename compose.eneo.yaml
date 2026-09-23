@@ -12,6 +12,9 @@ services:
       - shared
 
 networks:
+  # declared because podman-compose only adds the implicit default network when a file
+  # declares no networks of its own
+  default: {}
   shared:
     name: ${VADSA_SHARED_NETWORK:-eneo-shared}
     external: true
