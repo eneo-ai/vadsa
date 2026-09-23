@@ -27,7 +27,7 @@ class ModelList(BaseModel):
 @router.get(
     "/v1/models",
     dependencies=[Depends(require_api_key)],
-    responses={401: {"model": ErrorResponse}},
+    responses={401: {"model": ErrorResponse, "description": "The API key is missing or wrong."}},
 )
 def list_models(request: Request) -> ModelList:
     name = request.app.state.settings.served_model_name

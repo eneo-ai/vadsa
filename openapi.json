@@ -37,7 +37,7 @@
             }
           },
           "401": {
-            "description": "Unauthorized",
+            "description": "The API key is missing or wrong.",
             "content": {
               "application/json": {
                 "schema": {
@@ -148,7 +148,7 @@
             }
           },
           "400": {
-            "description": "Bad Request",
+            "description": "The request or the audio is invalid.",
             "content": {
               "application/json": {
                 "schema": {
@@ -158,7 +158,7 @@
             }
           },
           "401": {
-            "description": "Unauthorized",
+            "description": "The API key is missing or wrong.",
             "content": {
               "application/json": {
                 "schema": {
@@ -168,7 +168,7 @@
             }
           },
           "404": {
-            "description": "Not Found",
+            "description": "`model` is not the served model.",
             "content": {
               "application/json": {
                 "schema": {
@@ -178,7 +178,7 @@
             }
           },
           "413": {
-            "description": "Content Too Large",
+            "description": "The upload is larger than allowed.",
             "content": {
               "application/json": {
                 "schema": {
@@ -188,7 +188,7 @@
             }
           },
           "503": {
-            "description": "Service Unavailable",
+            "description": "The model is loading or the server is busy; retry after Retry-After.",
             "content": {
               "application/json": {
                 "schema": {

@@ -93,11 +93,16 @@ _FORM = {
     response_model=Transcription | TranscriptionVerbose,
     responses={
         200: {"content": {"text/plain": {"schema": {"type": "string"}}}},
-        400: {"model": ErrorResponse},
-        401: {"model": ErrorResponse},
-        404: {"model": ErrorResponse},
-        413: {"model": ErrorResponse},
-        503: {"model": ErrorResponse},
+        # explicit descriptions: the defaults are http.HTTPStatus phrases, which differ between
+        # Python versions (3.13 renamed 413), so the committed OpenAPI would too
+        400: {"model": ErrorResponse, "description": "The request or the audio is invalid."},
+        401: {"model": ErrorResponse, "description": "The API key is missing or wrong."},
+        404: {"model": ErrorResponse, "description": "`model` is not the served model."},
+        413: {"model": ErrorResponse, "description": "The upload is larger than allowed."},
+        503: {
+            "model": ErrorResponse,
+            "description": "The model is loading or the server is busy; retry after Retry-After.",
+        },
     },
     openapi_extra={
         "requestBody": {"required": True, "content": {"multipart/form-data": {"schema": _FORM}}}
