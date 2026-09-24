@@ -78,7 +78,7 @@ text as the transcription endpoint.
 
 ```json
 {"type": "session.created", "id": "sess-3f1c9b0e2d8a4b7c9e6f5a4b3c2d1e0f", "created": 1790157305}
-{"type": "transcription.delta", "delta": "Hej och", "audio_start": 0.0, "audio_end": 0.54}
+{"type": "transcription.delta", "delta": "Hej och", "audio_start": 0.0, "audio_end": 1.58}
 {"type": "transcription.delta", "delta": " välkomna.", "audio_start": 0.54, "audio_end": 2.5}
 {"type": "transcription.done", "text": "Hej och välkomna.", "usage": null, "audio_seconds": 2.5}
 {"type": "error", "error": "Too many realtime sessions.", "code": "capacity_exceeded"}
@@ -86,21 +86,26 @@ text as the transcription endpoint.
 
 `usage` is always null. `error` is a message for people; clients should act on `code`.
 
-`audio_start` and `audio_end` describe the delta's token-commit window in float seconds
-of submitted audio. The clock starts at the first submitted sample and excludes
+`audio_start` is where the step's newly committed text can begin; `audio_end` is the
+end of the audio the model had heard at that step. Both are float seconds of submitted
+audio. The clock starts at the first submitted sample and excludes
 the server's lead-in silence; a new session starts a new clock at 0. Both bounds are
 clamped to the submitted audio length and never decrease across deltas. The start has
 millisecond precision. The delta from the final step ends at the submitted audio length.
 Silent steps send no delta, so a session without speech sends only `transcription.done`.
 
 For frame duration `F`, effective commit delay `D`, and lead-in `L`, step `k` covers
-`[(k - 1) * F - D - L, k * F - D - L)`, clamped to the submitted audio. NeMo's delay
+`[(k - 1) * F - D - L, k * F - L)`, clamped to the submitted audio. NeMo's delay
 is its right padding rounded up to whole model frames, independently of the chunk size.
 The fake engine commits its current frame and has no delay.
 
 With the default 1.04 s frames, 1.04 s effective right padding and 0.5 s lead-in, this is
-`[(k - 2) * 1.04 - 0.5, (k - 1) * 1.04 - 0.5)`, clamped to the submitted audio. The
+`[(k - 2) * 1.04 - 0.5, k * 1.04 - 0.5)`, clamped to the submitted audio. The
 final step also covers the remaining tail.
+
+An utterance endpoint can commit text from the right context before the final step.
+The end therefore includes all audio heard by that step, and consecutive delta windows
+can overlap by the right context.
 
 These are token-commit windows, not word-level timestamps or a guarantee that every
 whole word lies within one delta's window. A word can be split across consecutive

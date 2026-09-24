@@ -246,12 +246,9 @@ class Scheduler:
             with self._lock:
                 stream.steps += 1
                 submitted = stream.received_samples / SAMPLE_RATE
-                end = (
-                    stream.steps * engine.frame_samples
-                    - engine.commit_delay_samples
-                    - engine.lead_in_samples
-                )
-                start = end - engine.frame_samples
+                # Endpointing can commit right-context text before the final frame.
+                end = stream.steps * engine.frame_samples - engine.lead_in_samples
+                start = end - engine.frame_samples - engine.commit_delay_samples
                 delta = StreamDelta(
                     text,
                     min(submitted, max(0.0, round(start / SAMPLE_RATE, 3))),

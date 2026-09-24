@@ -56,11 +56,12 @@ def nemo_pipeline(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
 
 
 class DelayedEngine(FakeEngine):
-    def __init__(self, delay: int) -> None:
+    def __init__(self, delay: int, endpoint_step: int | None = None) -> None:
         super().__init__(frame_samples=16640)
         self.lead_in_samples = 8000
         self.commit_delay_samples = delay
-        self.pending: dict[int, str] = {}
+        self.endpoint_step = endpoint_step
+        self.pending: dict[int, list[str]] = {}
 
     def step(self, frames: list[Frame]) -> list[str]:
         current = super().step(frames)
@@ -68,17 +69,21 @@ class DelayedEngine(FakeEngine):
             return current
         committed = []
         for frame, text in zip(frames, current, strict=True):
-            previous = self.pending.pop(frame.stream_id, "")
-            committed.append(previous + text if frame.is_last else previous)
-            if not frame.is_last:
-                self.pending[frame.stream_id] = text
+            pending = self.pending.setdefault(frame.stream_id, [])
+            pending.append(text)
+            if frame.is_last or self.streams[frame.stream_id] == self.endpoint_step:
+                committed.append("".join(self.pending.pop(frame.stream_id)))
+            elif len(pending) > self.commit_delay_samples // self.frame_samples:
+                committed.append(pending.pop(0))
+            else:
+                committed.append("")
         return committed
 
 
 @pytest.mark.parametrize(
     ("requested", "effective", "delay", "expected"),
     [
-        (1.0, 1.04, 16640, [("ord0", 0.0, 0.54), (" ord1 ord2", 0.54, 2.62)]),
+        (1.0, 1.04, 16640, [("ord0", 0.0, 1.58), (" ord1 ord2", 0.54, 2.62)]),
         (0.0, 0.0, 0, [("ord0", 0.0, 0.54), (" ord1", 0.54, 1.58), (" ord2", 1.58, 2.62)]),
     ],
     ids=["default-right-padding", "zero-right-padding"],
@@ -102,6 +107,26 @@ def test_nemo_commit_delay_controls_delta_windows(
         ws.send_json({"type": "input_audio_buffer.commit", "final": True})
         deltas = until_done(ws)[:-1]
     assert [(d["delta"], d["audio_start"], d["audio_end"]) for d in deltas] == expected
+
+
+def test_a_nonfinal_endpoint_flush_is_inside_the_audio_seen_by_its_step() -> None:
+    engine = DelayedEngine(delay=33280, endpoint_step=5)
+    with serve(engine) as client, client.websocket_connect(PATH, headers=AUTH) as ws:
+        start(ws)
+        append(ws, speech(6.0))
+        deltas = [ws.receive_json() for _ in range(3)]
+        endpoint = deltas[-1]
+        assert endpoint["delta"] == " ord2 ord3 ord4"
+        # ord3 represents right-context speech at 3.18 s, committed before the final frame.
+        assert endpoint["audio_start"] <= 3.18 <= endpoint["audio_end"]
+        ws.send_json({"type": "input_audio_buffer.commit", "final": True})
+        deltas.extend(until_done(ws)[:-1])
+    assert [(d["audio_start"], d["audio_end"]) for d in deltas] == [
+        (0.0, 2.62),
+        (0.54, 3.66),
+        (1.58, 4.7),
+        (3.66, 6.0),
+    ]
 
 
 def test_nemo_commit_delay_uses_padding_rounded_independently_of_chunk(
