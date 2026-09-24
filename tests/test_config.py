@@ -32,3 +32,11 @@ def test_the_wall_clock_backstop_outlasts_the_audio_limit() -> None:
 
 def test_development_may_run_without_keys() -> None:
     assert Settings(environment="development", engine="fake").api_keys == frozenset()
+
+
+@pytest.mark.parametrize(
+    "field", ["stream_chunk_seconds", "stream_left_padding_seconds", "stream_right_padding_seconds"]
+)
+def test_stream_timing_settings_must_be_finite(field: str) -> None:
+    with pytest.raises(ValidationError, match=field):
+        Settings(environment="development", **{field: float("inf")})

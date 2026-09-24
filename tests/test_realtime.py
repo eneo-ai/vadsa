@@ -2,10 +2,13 @@ import asyncio
 import base64
 import json
 import re
+import sys
 import threading
 import time
 from contextlib import suppress
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -16,10 +19,111 @@ from starlette.websockets import WebSocketDisconnect
 
 from conftest import AUTH, MODEL, GatedEngine, serve, speech, transcribe, wait_until
 from vadsa.api import realtime as realtime_api
+from vadsa.config import Settings
+from vadsa.engine.base import Frame
 from vadsa.engine.fake import FakeEngine
+from vadsa.engine.nemo import NemoEngine
 from vadsa.engine.scheduler import AtCapacity, Scheduler
 
 PATH = "/v1/realtime?intent=transcription"
+
+
+@pytest.fixture
+def nemo_pipeline(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    pipeline = SimpleNamespace(
+        chunk_size=1.04,
+        right_padding_size=1.04,
+        sample_rate=16000,
+        stateful=True,
+        open_session=Mock(),
+    )
+    cfg = SimpleNamespace(asr=SimpleNamespace(), streaming=SimpleNamespace())
+    modules = {
+        "torch": Mock(),
+        "nemo.collections.asr.inference.factory.pipeline_builder": SimpleNamespace(
+            PipelineBuilder=SimpleNamespace(build_pipeline=Mock(return_value=pipeline))
+        ),
+        "nemo.collections.asr.inference.streaming.framing.request": SimpleNamespace(Frame=Mock()),
+        "nemo.collections.asr.inference.streaming.framing.request_options": SimpleNamespace(
+            ASRRequestOptions=Mock()
+        ),
+        "nemo.collections.asr.models": SimpleNamespace(ASRModel=Mock()),
+        "omegaconf": SimpleNamespace(OmegaConf=SimpleNamespace(load=Mock(return_value=cfg))),
+    }
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    return pipeline
+
+
+class DelayedEngine(FakeEngine):
+    def __init__(self, delay: int) -> None:
+        super().__init__(frame_samples=16640)
+        self.lead_in_samples = 8000
+        self.commit_delay_samples = delay
+        self.pending: dict[int, str] = {}
+
+    def step(self, frames: list[Frame]) -> list[str]:
+        current = super().step(frames)
+        if not self.commit_delay_samples:
+            return current
+        committed = []
+        for frame, text in zip(frames, current, strict=True):
+            previous = self.pending.pop(frame.stream_id, "")
+            committed.append(previous + text if frame.is_last else previous)
+            if not frame.is_last:
+                self.pending[frame.stream_id] = text
+        return committed
+
+
+@pytest.mark.parametrize(
+    ("requested", "effective", "delay", "expected"),
+    [
+        (1.0, 1.04, 16640, [("ord0", 0.0, 0.54), (" ord1 ord2", 0.54, 2.62)]),
+        (0.0, 0.0, 0, [("ord0", 0.0, 0.54), (" ord1", 0.54, 1.58), (" ord2", 1.58, 2.62)]),
+    ],
+    ids=["default-right-padding", "zero-right-padding"],
+)
+def test_nemo_commit_delay_controls_delta_windows(
+    nemo_pipeline: SimpleNamespace,
+    requested: float,
+    effective: float,
+    delay: int,
+    expected: list[tuple[str, float, float]],
+) -> None:
+    nemo_pipeline.right_padding_size = effective
+    engine = NemoEngine(Settings(environment="development", stream_right_padding_seconds=requested))
+    assert engine.commit_delay_samples == delay
+    with (
+        serve(DelayedEngine(engine.commit_delay_samples)) as client,
+        client.websocket_connect(PATH, headers=AUTH) as ws,
+    ):
+        start(ws)
+        append(ws, speech(2.62))
+        ws.send_json({"type": "input_audio_buffer.commit", "final": True})
+        deltas = until_done(ws)[:-1]
+    assert [(d["delta"], d["audio_start"], d["audio_end"]) for d in deltas] == expected
+
+
+def test_nemo_commit_delay_uses_padding_rounded_independently_of_chunk(
+    nemo_pipeline: SimpleNamespace,
+) -> None:
+    nemo_pipeline.right_padding_size = 0.32
+    engine = NemoEngine(Settings(environment="development", stream_right_padding_seconds=0.3))
+    assert engine.frame_samples == 16640
+    assert engine.commit_delay_samples == 5120
+
+
+@pytest.mark.parametrize(
+    "invalid", [{"stateful": False}, {"right_padding_size": float("inf")}, {"sample_rate": 8000}]
+)
+def test_nemo_refuses_settings_without_a_known_commit_delay(
+    nemo_pipeline: SimpleNamespace, invalid: dict[str, object]
+) -> None:
+    for name, value in invalid.items():
+        setattr(nemo_pipeline, name, value)
+    with pytest.raises(ValueError, match="Invalid realtime settings"):
+        NemoEngine(Settings(environment="development"))
+    nemo_pipeline.open_session.assert_not_called()
 
 
 def append(ws: WebSocketTestSession, samples: np.ndarray) -> None:
@@ -181,9 +285,9 @@ def test_a_session_streams_deltas_then_done_in_vllm_shapes(client: TestClient) -
     assert re.fullmatch(r"sess-[0-9a-f]{32}", created["id"])
     assert abs(created["created"] - time.time()) < 60
     assert events == [
-        {"type": "transcription.delta", "delta": "ord0", "audio_start": 0.0, "audio_end": 0.0},
-        {"type": "transcription.delta", "delta": " ord1", "audio_start": 0.0, "audio_end": 1.0},
-        {"type": "transcription.delta", "delta": " ord2", "audio_start": 1.0, "audio_end": 2.5},
+        {"type": "transcription.delta", "delta": "ord0", "audio_start": 0.0, "audio_end": 1.0},
+        {"type": "transcription.delta", "delta": " ord1", "audio_start": 1.0, "audio_end": 2.0},
+        {"type": "transcription.delta", "delta": " ord2", "audio_start": 2.0, "audio_end": 2.5},
         {
             "type": "transcription.done",
             "text": "ord0 ord1 ord2",
@@ -208,15 +312,15 @@ def test_a_final_commit_without_audio_is_done_with_no_text(client: TestClient) -
     [
         (0.2, None, [("ord0", 0.0, 0.2)]),
         (0.54, None, [("ord0", 0.0, 0.54)]),
-        (2.62, None, [("ord0", 0.0, 0.0), (" ord1", 0.0, 0.54), (" ord2", 0.54, 2.62)]),
+        (2.62, None, [("ord0", 0.0, 0.54), (" ord1", 0.54, 1.58), (" ord2", 1.58, 2.62)]),
         (
             4.0,
             (0.54, 1.58),
             [
-                ("ord0", 0.0, 0.0),
-                (" ord2", 0.54, 1.58),
-                (" ord3", 1.58, 2.62),
-                (" ord4", 2.62, 4.0),
+                ("ord0", 0.0, 0.54),
+                (" ord2", 1.58, 2.62),
+                (" ord3", 2.62, 3.66),
+                (" ord4", 3.66, 4.0),
             ],
         ),
     ],
@@ -449,7 +553,7 @@ def test_a_disconnect_clears_the_stream_state() -> None:
                 "type": "transcription.delta",
                 "delta": "ord0",
                 "audio_start": 0.0,
-                "audio_end": 0.0,
+                "audio_end": 1.0,
             }
             assert engine.streams
         wait_until(lambda: not engine.streams)

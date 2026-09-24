@@ -46,6 +46,8 @@ class Engine(Protocol):
 
     # samples per streaming frame, as the model decodes them
     frame_samples: int
+    # audio between the end of the committed window and the end of the current frame
+    commit_delay_samples: int
     # silence put ahead of a stream's first audio, for a model that needs some before speech
     lead_in_samples: int
 

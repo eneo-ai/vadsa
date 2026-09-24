@@ -246,8 +246,12 @@ class Scheduler:
             with self._lock:
                 stream.steps += 1
                 submitted = stream.received_samples / SAMPLE_RATE
-                start = (stream.steps - 2) * engine.frame_samples - engine.lead_in_samples
-                end = (stream.steps - 1) * engine.frame_samples - engine.lead_in_samples
+                end = (
+                    stream.steps * engine.frame_samples
+                    - engine.commit_delay_samples
+                    - engine.lead_in_samples
+                )
+                start = end - engine.frame_samples
                 delta = StreamDelta(
                     text,
                     min(submitted, max(0.0, round(start / SAMPLE_RATE, 3))),

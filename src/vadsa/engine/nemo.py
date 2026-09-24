@@ -4,6 +4,7 @@ and a second model instance for batch transcription.
 NeMo and torch are imported when the engine is built, so the rest of vadsa (and its
 tests) runs without them."""
 
+import math
 from pathlib import Path
 
 import numpy as np
@@ -42,10 +43,28 @@ class NemoEngine:
         cfg.streaming.left_padding_size = settings.stream_left_padding_seconds
         cfg.streaming.right_padding_size = settings.stream_right_padding_seconds
         self._pipeline = PipelineBuilder.build_pipeline(cfg)
-        self._pipeline.open_session()
+        if (
+            not self._pipeline.stateful
+            or self._pipeline.sample_rate != SAMPLE_RATE
+            or not math.isfinite(self._pipeline.chunk_size)
+            or self._pipeline.chunk_size <= 0
+            or not math.isfinite(self._pipeline.right_padding_size)
+            or self._pipeline.right_padding_size < 0
+        ):
+            raise ValueError(
+                "Invalid realtime settings: audio spans require a stateful 16 kHz pipeline "
+                "with a finite positive chunk size and finite non-negative right padding."
+            )
         # A stateful pipeline rounds its sizes up to whole model frames; the frame it
         # decodes is its own chunk_size, never the requested one.
         self.frame_samples = int(self._pipeline.chunk_size * self._pipeline.sample_rate)
+        # NeMo rounds right padding independently to model frames, then commits the
+        # chunk before that context. Read the effective size, not the requested setting.
+        # https://github.com/NVIDIA/NeMo/blob/v3.0.0/nemo/collections/asr/inference/pipelines/buffered_rnnt_pipeline.py#L95-L123
+        self.commit_delay_samples = int(
+            self._pipeline.right_padding_size * self._pipeline.sample_rate
+        )
+        self._pipeline.open_session()
 
         load = (
             ASRModel.restore_from if settings.model.endswith(".nemo") else ASRModel.from_pretrained

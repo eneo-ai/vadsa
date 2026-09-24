@@ -37,9 +37,9 @@ class Settings(BaseSettings):
     idle_timeout_seconds: float = Field(default=300, gt=0)
     max_pending_seconds: float = Field(default=30, gt=0)
     # requested sizes; NeMo rounds them up to whole model frames (80 ms)
-    stream_chunk_seconds: float = Field(default=1.0, gt=0)
-    stream_left_padding_seconds: float = Field(default=6.0, ge=0)
-    stream_right_padding_seconds: float = Field(default=1.0, ge=0)
+    stream_chunk_seconds: float = Field(default=1.0, gt=0, allow_inf_nan=False)
+    stream_left_padding_seconds: float = Field(default=6.0, ge=0, allow_inf_nan=False)
+    stream_right_padding_seconds: float = Field(default=1.0, ge=0, allow_inf_nan=False)
 
     @field_validator("api_keys", mode="before")
     @classmethod
