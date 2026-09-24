@@ -31,9 +31,9 @@ class Settings(BaseSettings):
     # how long a session may stay open before its final commit; the audio has its own
     # limit, so this only ends a client that never finishes
     max_session_wall_seconds: float = Field(default=39_600, gt=0)
-    # from the final commit to transcription.done; what is left to decode then is at most
-    # max_pending_seconds of audio, after at most one transcription window
-    finalize_seconds: float = Field(default=60, gt=0)
+    # from reading the final commit to sending transcription.done; below the client's own
+    # wait, which also spans the commit's way here and the text's way back
+    finalize_seconds: float = Field(default=45, gt=0)
     idle_timeout_seconds: float = Field(default=300, gt=0)
     max_pending_seconds: float = Field(default=30, gt=0)
     # requested sizes; NeMo rounds them up to whole model frames (80 ms)

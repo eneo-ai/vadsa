@@ -1,17 +1,23 @@
+import asyncio
 import base64
+import json
 import re
 import threading
 import time
+from contextlib import suppress
 from typing import Any
 
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 from starlette.testclient import WebSocketTestSession
+from starlette.types import ASGIApp, Message
 from starlette.websockets import WebSocketDisconnect
 
 from conftest import AUTH, MODEL, GatedEngine, serve, speech, transcribe, wait_until
+from vadsa.api import realtime as realtime_api
 from vadsa.engine.fake import FakeEngine
+from vadsa.engine.scheduler import AtCapacity, Scheduler
 
 PATH = "/v1/realtime?intent=transcription"
 
@@ -50,6 +56,86 @@ def opens(client: TestClient) -> bool:
     """Whether a new session gets a slot."""
     with client.websocket_connect(PATH, headers=AUTH) as ws:
         return ws.receive_json()["type"] == "session.created"
+
+
+def appended(samples: np.ndarray) -> dict[str, Any]:
+    pcm = (samples * 32767).astype("<i2").tobytes()
+    return {"type": "input_audio_buffer.append", "audio": base64.b64encode(pcm).decode()}
+
+
+async def stuck_session(
+    app: ASGIApp, events: list[dict[str, Any]], stuck_on: str
+) -> tuple[asyncio.Task[None], list[dict[str, Any]]]:
+    """A session straight through ASGI whose client sends `events` and then nothing, and
+    stops reading when the server sends an event of type `stuck_on`: that send never
+    returns. Returns the running app and the events the client did read."""
+    incoming = [{"type": "websocket.connect"}] + [
+        {"type": "websocket.receive", "text": json.dumps(event)} for event in events
+    ]
+    read: list[dict[str, Any]] = []
+    never = asyncio.Event()
+
+    async def receive() -> Message:
+        if incoming:
+            return incoming.pop(0)
+        await never.wait()
+        raise AssertionError("unreachable")
+
+    async def send(message: Message) -> None:
+        if message["type"] == "websocket.send":
+            event = json.loads(message["text"])
+            if event["type"] == stuck_on:
+                await never.wait()
+            read.append(event)
+
+    scope = {
+        "type": "websocket",
+        "path": "/v1/realtime",
+        "raw_path": b"/v1/realtime",
+        "root_path": "",
+        "query_string": b"",
+        "headers": [(b"authorization", AUTH["Authorization"].encode())],
+        "scheme": "ws",
+        "client": ("127.0.0.1", 50000),
+        "server": ("testserver", 80),
+        "subprotocols": [],
+    }
+    return asyncio.ensure_future(app(scope, receive, send)), read
+
+
+def slot_free(scheduler: Scheduler) -> bool:
+    with suppress(AtCapacity):
+        scheduler.discard(scheduler.open_stream(lambda event: None))
+        return True
+    return False
+
+
+async def test_a_final_text_the_client_does_not_take_still_ends_at_the_grace() -> None:
+    with serve(finalize_seconds=0.3) as client:
+        events = [
+            {"type": "session.update", "model": MODEL},
+            appended(speech(1.5)),
+            {"type": "input_audio_buffer.commit", "final": True},
+        ]
+        session, read = await stuck_session(client.app, events, "transcription.done")
+        # the grace covers sending the final text too, not only decoding it
+        await asyncio.wait_for(session, 3)
+    assert read[-1]["type"] == "error" and read[-1]["code"] == "finalize_timeout"
+
+
+async def test_a_refused_session_frees_its_slot_before_its_error_reaches_the_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(realtime_api, "CLOSE_SECONDS", 0.2, raising=False)
+    with serve(max_sessions=1, idle_timeout_seconds=0.2) as client:
+        events = [{"type": "session.update", "model": MODEL}, appended(speech(0.5))]
+        session, read = await stuck_session(client.app, events, "error")
+        await asyncio.to_thread(wait_until, lambda: read)  # the session holds the slot
+        # it idles out; its error event never leaves, and its slot is free anyway
+        await asyncio.to_thread(wait_until, lambda: slot_free(client.app.state.scheduler))
+        # and the handler does not wait on that client for long
+        await asyncio.wait_for(session, 3)
+    assert [event["type"] for event in read] == ["session.created"]
 
 
 def test_a_session_streams_deltas_then_done_in_vllm_shapes(client: TestClient) -> None:
@@ -138,16 +224,21 @@ def test_audio_past_the_session_limit_is_refused() -> None:
         assert refusal(ws) == ("session_too_long", 1000)
 
 
-def test_the_final_text_gets_its_own_time_after_the_final_commit() -> None:
+@pytest.mark.parametrize(
+    "limits",
+    [{"max_session_seconds": 0.5}, {"max_session_seconds": 0.4, "max_session_wall_seconds": 0.6}],
+    ids=["past-the-audio-length", "past-the-wall-clock-backstop"],
+)
+def test_the_final_text_gets_its_own_time_after_the_final_commit(limits: dict[str, float]) -> None:
     engine = GatedEngine()
     with (
-        serve(engine, max_session_seconds=0.5) as client,
+        serve(engine, **limits) as client,
         client.websocket_connect(PATH, headers=AUTH) as ws,
     ):
         start(ws)
         append(ws, speech(0.3))
         ws.send_json({"type": "input_audio_buffer.commit", "final": True})
-        # the last frame holds the GPU well past the session's audio length in wall time
+        # the last frame holds the GPU past the audio's length and past the backstop
         wait_until(lambda: engine.calls)
         time.sleep(0.8)
         engine.gate.set()

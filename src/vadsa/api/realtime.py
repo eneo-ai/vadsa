@@ -32,6 +32,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 MAX_APPEND_BYTES = 1024 * 1024
+# how long the closing error and close may take to leave; the session's resources are
+# already released by then
+CLOSE_SECONDS = 5
 
 
 class SessionEnd(Exception):
@@ -58,6 +61,7 @@ async def realtime(websocket: WebSocket) -> None:
             loop.call_soon_threadsafe(events.put_nowait, event)
 
     stream: Stream | None = None
+    refusal: SessionEnd | None = None
     try:
         token = bearer_token(websocket.headers.get("authorization"))
         if not key_accepted(token, settings.api_keys):
@@ -75,19 +79,19 @@ async def realtime(websocket: WebSocket) -> None:
                 "created": int(time.time()),
             }
         )
-        text = await _run(websocket, scheduler, stream, events, settings)
-        await websocket.send_json({"type": "transcription.done", "text": text, "usage": None})
-        await websocket.close(1000)
+        await _run(websocket, scheduler, stream, events, settings)
     except SessionEnd as end:
-        await _refuse(websocket, end)
+        refusal = end
     except WebSocketDisconnect:
-        pass
+        return
     except Exception:
         logger.exception("realtime session failed")
-        await _refuse(websocket, SessionEnd(1011, "internal_error", "Internal server error."))
+        refusal = SessionEnd(1011, "internal_error", "Internal server error.")
     finally:
+        # before the closing message, which a client that stopped reading never takes
         if stream is not None:
             scheduler.discard(stream)
+    await _close(websocket, refusal)
 
 
 async def _run(
@@ -96,26 +100,26 @@ async def _run(
     stream: Stream,
     events: asyncio.Queue[StreamEvent],
     settings: Settings,
-) -> str:
-    """Relay client events and the stream's text until the final commit is decoded, or the
-    client, a limit or a failure ends the session first.
+) -> None:
+    """Relay client events and the stream's text until `transcription.done` is sent, or the
+    client, a limit or a failure ends the session first; the session's deadlines cover
+    sending the text as well as decoding it.
 
     Plain asyncio.wait rather than a TaskGroup or gather: those can replace or swallow the
     CancelledError of a session that is being cancelled."""
     receiver = asyncio.create_task(_receive(websocket, scheduler, stream, settings))
-    sender = asyncio.create_task(_send_deltas(websocket, events))
+    sender = asyncio.create_task(_send_text(websocket, events))
     try:
-        # the receiver only ever ends with an error, the sender with the text or an error
+        # the receiver only ever ends with an error, the sender once the text is out
         await asyncio.wait((receiver, sender), return_when=asyncio.FIRST_COMPLETED)
     finally:
         receiver.cancel()
         sender.cancel()
-        # the other side stops before the session sends its last event
+        # the other side stops before the session closes
         await asyncio.wait((receiver, sender))
     for task in (receiver, sender):
         if not task.cancelled() and (error := task.exception()) is not None:
             raise error
-    return sender.result()
 
 
 async def _receive(
@@ -136,7 +140,7 @@ async def _receive(
                 message = await websocket.receive()
         if loop.time() >= session_ends:
             if audio_ended:
-                raise SessionEnd(1013, "finalize_timeout", "The final text was not ready in time.")
+                raise SessionEnd(1013, "finalize_timeout", "The final text was not sent in time.")
             raise SessionEnd(1000, "session_too_long", "The session reached its time limit.")
         if message is None:
             raise SessionEnd(1000, "idle_timeout", "No audio arrived in time.")
@@ -182,8 +186,8 @@ async def _receive(
                 raise SessionEnd(1008, "unknown_event", f"Unknown event type: {other}")
 
 
-async def _send_deltas(websocket: WebSocket, events: asyncio.Queue[StreamEvent]) -> str:
-    """Send each piece of committed text as a delta; return the whole text."""
+async def _send_text(websocket: WebSocket, events: asyncio.Queue[StreamEvent]) -> None:
+    """Send each piece of committed text as a delta, then the whole text as done."""
     text = ""
     while (event := await events.get()) is not None:
         if isinstance(event, BaseException):
@@ -193,7 +197,7 @@ async def _send_deltas(websocket: WebSocket, events: asyncio.Queue[StreamEvent])
         if delta:
             text += delta
             await websocket.send_json({"type": "transcription.delta", "delta": delta})
-    return text
+    await websocket.send_json({"type": "transcription.done", "text": text, "usage": None})
 
 
 def _parse(text: str | None) -> dict[str, Any]:
@@ -225,8 +229,14 @@ def _audio(event: dict[str, Any]) -> np.ndarray:
     return pcm16_to_float32(pcm)
 
 
-async def _refuse(websocket: WebSocket, end: SessionEnd) -> None:
-    # the client may already be gone
-    with suppress(WebSocketDisconnect, RuntimeError):
-        await websocket.send_json({"type": "error", "error": end.message, "code": end.code})
-        await websocket.close(end.close_code)
+async def _close(websocket: WebSocket, refusal: SessionEnd | None) -> None:
+    """Close after `transcription.done`, or send a refused session's error and close; a
+    client that is gone or stopped reading gets CLOSE_SECONDS for both."""
+    with suppress(WebSocketDisconnect, RuntimeError, TimeoutError):
+        async with asyncio.timeout(CLOSE_SECONDS):
+            if refusal is None:
+                await websocket.close(1000)
+                return
+            error = {"type": "error", "error": refusal.message, "code": refusal.code}
+            await websocket.send_json(error)
+            await websocket.close(refusal.close_code)

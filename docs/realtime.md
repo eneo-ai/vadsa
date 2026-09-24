@@ -33,12 +33,21 @@ as `?intent=transcription` is accepted and ignored.
 A session is limited by the audio it sends, not by how long it stays open: at most
 `VADSA_MAX_SESSION_SECONDS` of audio (5 h), however long the recording pauses in between.
 Only a session that stays open for `VADSA_MAX_SESSION_WALL_SECONDS` (11 h) without its
-final commit is ended regardless. After the final commit the final text has
-`VADSA_FINALIZE_SECONDS` (60 s), whenever the commit comes. What is left to decode then is
-at most `VADSA_MAX_PENDING_SECONDS` of audio, after at most one transcription window
-running on the GPU. A client should allow at least that long for `transcription.done`
-(Eneo waits 60 s), and its own audio limit should be at most vadsa's, so its own error
-comes first.
+final commit is ended regardless. A client's own audio limit should be at most
+`VADSA_MAX_SESSION_SECONDS`, so its own error comes first.
+
+After the final commit, `transcription.done` has to be sent within
+`VADSA_FINALIZE_SECONDS` (45 s), however long the session was open. What is left then is
+the audio still waiting for the GPU, at most `VADSA_MAX_PENDING_SECONDS`: one realtime step
+per frame of it. While transcription requests wait as well, the GPU alternates, so each of
+those steps can first wait for one transcription window (up to `VADSA_WINDOW_SECONDS` of
+audio), after whatever the GPU is running at the commit. A session whose audio the GPU
+keeps up with has one or two steps left.
+
+The grace starts when vadsa reads the final commit and ends when `transcription.done` is
+sent. The client's wait starts earlier, when it sends the commit, and ends later, when the
+text arrives. `VADSA_FINALIZE_SECONDS` plus both of those trips must fit in the client's
+wait: Eneo waits 60 s, which leaves 15 s with the default.
 
 Audio is 16 kHz mono PCM16, little endian, base64 encoded. The server decodes it in frames
 of about one second (1.04 s with the default settings, the requested
@@ -93,7 +102,7 @@ an error.
 | `falling_behind` | 1013 | More than `VADSA_MAX_PENDING_SECONDS` of the session's audio waits for the GPU. |
 | `internal_error` | 1011 | Decoding failed on the server. |
 | `session_too_long` | 1000 | An append would take the session past `VADSA_MAX_SESSION_SECONDS` of audio, or the session was open for `VADSA_MAX_SESSION_WALL_SECONDS` without its final commit. |
-| `finalize_timeout` | 1013 | The final text was not ready within `VADSA_FINALIZE_SECONDS` of the final commit. |
+| `finalize_timeout` | 1013 | `transcription.done` could not be sent within `VADSA_FINALIZE_SECONDS` of the final commit: the text was not ready, or the client did not take it. |
 | `idle_timeout` | 1000 | No append arrived for `VADSA_IDLE_TIMEOUT_SECONDS` before the final commit. |
 
 Close code 1013 means try again later. A client that disconnects, or a session that ends
