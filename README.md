@@ -121,7 +121,9 @@ defaults.
 | `VADSA_WINDOW_SECONDS` | `600` | Longer audio is transcribed in windows of at most this length |
 | `VADSA_MAX_BATCH_REQUESTS` | `4` | Transcription requests in progress or queued; more get 503 |
 | `VADSA_MAX_SESSIONS` | `32` | Open realtime sessions; more are refused |
-| `VADSA_MAX_SESSION_SECONDS` | `18000` | Longest a realtime session may stay open |
+| `VADSA_MAX_SESSION_SECONDS` | `18000` (5 h) | Audio a realtime session may send; more is refused. Keep it at or above the client's own limit (Eneo's is 5 h), so the client's limit and error come first |
+| `VADSA_MAX_SESSION_WALL_SECONDS` | `39600` (11 h) | Longest a realtime session may stay open before its final commit: a backstop for a client that never finishes. Must be longer than `VADSA_MAX_SESSION_SECONDS` |
+| `VADSA_FINALIZE_SECONDS` | `60` | Longest from a session's final commit to its `transcription.done`, however long the session was open. Keep it at or below the client's own wait for the final text (Eneo waits 60 s) |
 | `VADSA_IDLE_TIMEOUT_SECONDS` | `300` | A realtime session with no audio for this long before its final commit is closed |
 | `VADSA_MAX_PENDING_SECONDS` | `30` | Audio a realtime session may have waiting for the GPU before it is ended |
 | `VADSA_STREAM_CHUNK_SECONDS` | `1.0` | Realtime frame length; NeMo rounds it up to whole 80 ms model frames (1.04 s) |

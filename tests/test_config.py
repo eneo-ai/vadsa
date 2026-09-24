@@ -19,5 +19,16 @@ def test_production_refuses_the_fake_engine() -> None:
         Settings(environment="production", api_keys="key", engine="fake")
 
 
+def test_the_wall_clock_backstop_outlasts_the_audio_limit() -> None:
+    # a live session sends its audio in real time, so a shorter backstop would end it first
+    with pytest.raises(ValidationError, match="VADSA_MAX_SESSION_WALL_SECONDS"):
+        Settings(
+            environment="development",
+            engine="fake",
+            max_session_seconds=3600,
+            max_session_wall_seconds=3600,
+        )
+
+
 def test_development_may_run_without_keys() -> None:
     assert Settings(environment="development", engine="fake").api_keys == frozenset()

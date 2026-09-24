@@ -16,7 +16,7 @@ from typing import Any
 import numpy as np
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from vadsa.audio import pcm16_to_float32
+from vadsa.audio import SAMPLE_RATE, pcm16_to_float32
 from vadsa.auth import bearer_token, key_accepted
 from vadsa.config import Settings
 from vadsa.engine.scheduler import (
@@ -121,10 +121,12 @@ async def _run(
 async def _receive(
     websocket: WebSocket, scheduler: Scheduler, stream: Stream, settings: Settings
 ) -> None:
-    """Client events until the session ends. After the final commit the socket is still
-    read, so a disconnect or the time limit ends a session whose last text is pending."""
+    """Client events until the session ends. The session's audio is limited; its time only
+    by a backstop until the final commit, and after it by the time the final text may take.
+    The socket is still read after the final commit, so a disconnect ends such a session."""
     loop = asyncio.get_running_loop()
-    session_ends = loop.time() + settings.max_session_seconds
+    audio_left = int(settings.max_session_seconds * SAMPLE_RATE)
+    session_ends = loop.time() + settings.max_session_wall_seconds
     idle_ends = loop.time() + settings.idle_timeout_seconds
     audio_ended = False
     while True:
@@ -133,6 +135,8 @@ async def _receive(
             async with asyncio.timeout_at(min(session_ends, idle_ends)):
                 message = await websocket.receive()
         if loop.time() >= session_ends:
+            if audio_ended:
+                raise SessionEnd(1013, "finalize_timeout", "The final text was not ready in time.")
             raise SessionEnd(1000, "session_too_long", "The session reached its time limit.")
         if message is None:
             raise SessionEnd(1000, "idle_timeout", "No audio arrived in time.")
@@ -144,8 +148,14 @@ async def _receive(
         event = _parse(message.get("text"))
         match event.get("type"):
             case "input_audio_buffer.append":
+                samples = _audio(event)
+                audio_left -= len(samples)
+                if audio_left < 0:
+                    raise SessionEnd(
+                        1000, "session_too_long", "The session reached its limit of audio."
+                    )
                 try:
-                    scheduler.append(stream, _audio(event))
+                    scheduler.append(stream, samples)
                 except FallingBehind:
                     raise SessionEnd(
                         1013, "falling_behind", "Too much audio is waiting to be transcribed."
@@ -157,8 +167,10 @@ async def _receive(
                     raise SessionEnd(1008, "invalid_event", "`final` must be true or false.")
                 if final:
                     scheduler.finish(stream)
-                    # later events change nothing, and waiting for the text is not idling
+                    # later events change nothing, and waiting for the text is not idling;
+                    # the text gets its own time, however long the session has been open
                     audio_ended, idle_ends = True, math.inf
+                    session_ends = loop.time() + settings.finalize_seconds
                 # vLLM clients commit once before streaming; audio is decoded as it arrives
             case "session.update":
                 model = event.get("model")

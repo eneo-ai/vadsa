@@ -26,7 +26,14 @@ class Settings(BaseSettings):
     max_batch_requests: int = Field(default=4, ge=1)
 
     max_sessions: int = Field(default=32, ge=1)
+    # audio a realtime session may send
     max_session_seconds: float = Field(default=18_000, gt=0)
+    # how long a session may stay open before its final commit; the audio has its own
+    # limit, so this only ends a client that never finishes
+    max_session_wall_seconds: float = Field(default=39_600, gt=0)
+    # from the final commit to transcription.done; what is left to decode then is at most
+    # max_pending_seconds of audio, after at most one transcription window
+    finalize_seconds: float = Field(default=60, gt=0)
     idle_timeout_seconds: float = Field(default=300, gt=0)
     max_pending_seconds: float = Field(default=30, gt=0)
     # requested sizes; NeMo rounds them up to whole model frames (80 ms)
@@ -48,4 +55,13 @@ class Settings(BaseSettings):
                 raise ValueError("VADSA_API_KEYS is required unless VADSA_ENVIRONMENT=development")
             if self.engine == "fake":
                 raise ValueError("VADSA_ENGINE=fake is only allowed in development")
+        return self
+
+    @model_validator(mode="after")
+    def _check_session_limits(self) -> "Settings":
+        # a live session sends its audio in real time, so a shorter backstop would end it first
+        if self.max_session_wall_seconds <= self.max_session_seconds:
+            raise ValueError(
+                "VADSA_MAX_SESSION_WALL_SECONDS must be longer than VADSA_MAX_SESSION_SECONDS"
+            )
         return self

@@ -112,28 +112,71 @@ def test_a_session_without_appends_ends_idle() -> None:
         assert refusal(ws) == ("idle_timeout", 1000)
 
 
-def test_a_session_ends_at_its_time_limit() -> None:
+def test_a_session_open_longer_than_its_audio_limit_still_finishes() -> None:
+    # the limit counts audio sent, so time spent without sending any is not held against it
     with (
-        serve(max_session_seconds=0.3) as client,
+        serve(max_session_seconds=1.0) as client,
         client.websocket_connect(PATH, headers=AUTH) as ws,
     ):
         start(ws)
-        for _ in range(20):
-            append(ws, speech(0.1))
-            time.sleep(0.05)
+        append(ws, speech(0.4))
+        time.sleep(1.2)
+        append(ws, speech(0.4))
+        ws.send_json({"type": "input_audio_buffer.commit", "final": True})
+        assert until_done(ws)[-1] == {"type": "transcription.done", "text": "ord0", "usage": None}
+
+
+def test_audio_past_the_session_limit_is_refused() -> None:
+    with (
+        serve(max_session_seconds=1.0) as client,
+        client.websocket_connect(PATH, headers=AUTH) as ws,
+    ):
+        start(ws)
+        append(ws, speech(0.6))
+        append(ws, speech(0.6))
+        ws.send_json({"type": "input_audio_buffer.commit", "final": True})
+        assert refusal(ws) == ("session_too_long", 1000)
+
+
+def test_the_final_text_gets_its_own_time_after_the_final_commit() -> None:
+    engine = GatedEngine()
+    with (
+        serve(engine, max_session_seconds=0.5) as client,
+        client.websocket_connect(PATH, headers=AUTH) as ws,
+    ):
+        start(ws)
+        append(ws, speech(0.3))
+        ws.send_json({"type": "input_audio_buffer.commit", "final": True})
+        # the last frame holds the GPU well past the session's audio length in wall time
+        wait_until(lambda: engine.calls)
+        time.sleep(0.8)
+        engine.gate.set()
+        assert until_done(ws)[-1] == {"type": "transcription.done", "text": "ord0", "usage": None}
+
+
+def test_a_session_that_never_finishes_ends_at_the_wall_clock_backstop() -> None:
+    # a trickle of silence keeps the session from idling and stays under its audio limit
+    with (
+        serve(max_session_seconds=0.2, max_session_wall_seconds=0.6) as client,
+        client.websocket_connect(PATH, headers=AUTH) as ws,
+    ):
+        start(ws)
+        for _ in range(10):
+            append(ws, np.zeros(160, np.float32))
+            time.sleep(0.1)
         assert refusal(ws) == ("session_too_long", 1000)
 
 
 @pytest.mark.parametrize(
-    ("ending", "max_session_seconds"),
-    [("disconnect", 60), ("time limit", 0.5)],
-    ids=["disconnect", "time-limit"],
+    ("ending", "settings"),
+    [("disconnect", {}), ("grace", {"finalize_seconds": 0.5})],
+    ids=["disconnect", "grace"],
 )
 def test_a_session_waiting_for_its_last_text_still_ends(
-    ending: str, max_session_seconds: float
+    ending: str, settings: dict[str, float]
 ) -> None:
     engine = GatedEngine()
-    with serve(engine, max_sessions=1, max_session_seconds=max_session_seconds) as client:
+    with serve(engine, max_sessions=1, **settings) as client:
         # a transcription holds the GPU, so the text is still due after the final commit
         batch = threading.Thread(target=transcribe, args=(client,))
         batch.start()
@@ -146,8 +189,8 @@ def test_a_session_waiting_for_its_last_text_still_ends(
                 ws.close()
             # the ended session drops its stream, which frees its slot
             wait_until(lambda: opens(client))
-            if ending == "time limit":
-                assert refusal(ws) == ("session_too_long", 1000)
+            if ending == "grace":
+                assert refusal(ws) == ("finalize_timeout", 1013)
         engine.gate.set()
         batch.join()
     # none of the ended session's audio reached the model
