@@ -64,28 +64,35 @@ def appended(samples: np.ndarray) -> dict[str, Any]:
 
 
 async def stuck_session(
-    app: ASGIApp, events: list[dict[str, Any]], stuck_on: str
+    app: ASGIApp, events: list[dict[str, Any]], stuck_on: str, *, until_deadline: bool = False
 ) -> tuple[asyncio.Task[None], list[dict[str, Any]]]:
     """A session straight through ASGI whose client sends `events` and then nothing, and
     stops reading when the server sends an event of type `stuck_on`: that send never
-    returns. Returns the running app and the events the client did read."""
+    returns, or with `until_deadline` returns in the loop turn in which the server's
+    deadline stops its wait for the client. Returns the running app and what the client
+    read, a close as {"type": "close", "code": ...}."""
     incoming = [{"type": "websocket.connect"}] + [
         {"type": "websocket.receive", "text": json.dumps(event)} for event in events
     ]
     read: list[dict[str, Any]] = []
-    never = asyncio.Event()
+    never, deadline_passed = asyncio.Event(), asyncio.Event()
 
     async def receive() -> Message:
         if incoming:
             return incoming.pop(0)
-        await never.wait()
+        try:
+            await never.wait()
+        finally:
+            deadline_passed.set()
         raise AssertionError("unreachable")
 
     async def send(message: Message) -> None:
+        if message["type"] == "websocket.close":
+            read.append({"type": "close", "code": message.get("code", 1000)})
         if message["type"] == "websocket.send":
             event = json.loads(message["text"])
             if event["type"] == stuck_on:
-                await never.wait()
+                await (deadline_passed if until_deadline else never).wait()
             read.append(event)
 
     scope = {
@@ -120,7 +127,29 @@ async def test_a_final_text_the_client_does_not_take_still_ends_at_the_grace() -
         session, read = await stuck_session(client.app, events, "transcription.done")
         # the grace covers sending the final text too, not only decoding it
         await asyncio.wait_for(session, 3)
-    assert read[-1]["type"] == "error" and read[-1]["code"] == "finalize_timeout"
+    assert [(event["type"], event["code"]) for event in read[-2:]] == [
+        ("error", "finalize_timeout"),
+        ("close", 1013),
+    ]
+
+
+async def test_a_final_text_sent_as_the_grace_runs_out_ends_the_session_as_done() -> None:
+    with serve(finalize_seconds=0.3) as client:
+        events = [
+            {"type": "session.update", "model": MODEL},
+            appended(speech(1.5)),
+            {"type": "input_audio_buffer.commit", "final": True},
+        ]
+        # the text leaves in the same loop turn as the grace runs out
+        session, read = await stuck_session(
+            client.app, events, "transcription.done", until_deadline=True
+        )
+        await asyncio.wait_for(session, 3)
+    # the text went out, so no error follows it
+    assert [(event["type"], event.get("code")) for event in read[-2:]] == [
+        ("transcription.done", None),
+        ("close", 1000),
+    ]
 
 
 async def test_a_refused_session_frees_its_slot_before_its_error_reaches_the_client(

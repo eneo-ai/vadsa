@@ -117,6 +117,10 @@ async def _run(
         sender.cancel()
         # the other side stops before the session closes
         await asyncio.wait((receiver, sender))
+    # once the text is out, the session ends as done, even if a deadline or the client's
+    # disconnect ended the receiver in the same turn
+    if not sender.cancelled() and sender.exception() is None:
+        return
     for task in (receiver, sender):
         if not task.cancelled() and (error := task.exception()) is not None:
             raise error
