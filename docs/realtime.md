@@ -78,13 +78,31 @@ text as the transcription endpoint.
 
 ```json
 {"type": "session.created", "id": "sess-3f1c9b0e2d8a4b7c9e6f5a4b3c2d1e0f", "created": 1790157305}
-{"type": "transcription.delta", "delta": "Hej och"}
-{"type": "transcription.delta", "delta": " välkomna."}
-{"type": "transcription.done", "text": "Hej och välkomna.", "usage": null}
+{"type": "transcription.delta", "delta": "Hej och", "audio_start": 0.0, "audio_end": 0.54}
+{"type": "transcription.delta", "delta": " välkomna.", "audio_start": 0.54, "audio_end": 2.5}
+{"type": "transcription.done", "text": "Hej och välkomna.", "usage": null, "audio_seconds": 2.5}
 {"type": "error", "error": "Too many realtime sessions.", "code": "capacity_exceeded"}
 ```
 
 `usage` is always null. `error` is a message for people; clients should act on `code`.
+
+`audio_start` and `audio_end` are float seconds of submitted audio covered by the step
+that produced the delta. The clock starts at the first submitted sample and excludes
+the server's lead-in silence; a new session starts a new clock at 0. Both bounds are
+clamped to the submitted audio length and never decrease across deltas. The start has
+millisecond precision. The delta from the final step ends at the submitted audio length.
+Silent steps send no delta, so a session without speech sends only `transcription.done`.
+
+With the default 1.04 s frames and 0.5 s lead-in, step `k` covers
+`[(k - 2) * 1.04 - 0.5, (k - 1) * 1.04 - 0.5)`, clamped to the submitted audio. The
+final step also covers the remaining tail. The words of a delta were spoken within
+`[audio_start - 0.05, audio_end + 0.3]` s (measured on Swedish speech, CPU); these are
+step windows, not word-level timestamps.
+
+`audio_seconds` on `transcription.done` is the number of received samples divided by
+16000, including silence and excluding the server's lead-in. It records the audio
+covered even when no text was produced. These timing fields extend vLLM's event shapes;
+clients that ignore unknown fields continue to work.
 
 ## Errors and close codes
 

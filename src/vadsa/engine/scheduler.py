@@ -28,9 +28,17 @@ from vadsa.engine.base import Engine, Frame, Transcript
 
 logger = logging.getLogger(__name__)
 
+
+@dataclass(frozen=True, slots=True)
+class StreamDelta:
+    text: str
+    audio_start: float
+    audio_end: float
+
+
 # What a stream's session receives: committed text after each step, then None once the
 # last frame is decoded, or the exception that ended the stream.
-StreamEvent = str | BaseException | None
+StreamEvent = StreamDelta | BaseException | None
 
 
 class ModelLoading(Exception):
@@ -56,6 +64,8 @@ class Stream:
     # a frame reached the engine, so the engine holds state for this id
     started: bool = False
     final: bool = False
+    received_samples: int = 0
+    steps: int = 0
 
 
 @dataclass(frozen=True, eq=False)
@@ -117,6 +127,7 @@ class Scheduler:
 
     def append(self, stream: Stream, samples: np.ndarray) -> None:
         with self._lock:
+            received = len(samples)
             if len(samples) and not stream.led_in and self._engine is not None:
                 # only real audio gets the lead-in, so an empty session ends at once
                 lead_in = np.zeros(self._engine.lead_in_samples, np.float32)
@@ -125,6 +136,7 @@ class Scheduler:
             stream.audio = np.concatenate((stream.audio, samples))
             if len(stream.audio) > self._max_pending_samples:
                 raise FallingBehind
+            stream.received_samples += received
             self._lock.notify()
 
     def finish(self, stream: Stream) -> None:
@@ -230,12 +242,22 @@ class Scheduler:
             for stream, _ in taken:
                 stream.deliver(error)
             return
-        with self._lock:
-            for stream, frame in taken:
+        for (stream, frame), text in zip(taken, texts, strict=True):
+            with self._lock:
+                stream.steps += 1
+                submitted = stream.received_samples / SAMPLE_RATE
+                start = (stream.steps - 2) * engine.frame_samples - engine.lead_in_samples
+                end = (stream.steps - 1) * engine.frame_samples - engine.lead_in_samples
+                delta = StreamDelta(
+                    text,
+                    min(submitted, max(0.0, round(start / SAMPLE_RATE, 3))),
+                    submitted
+                    if frame.is_last
+                    else min(submitted, max(0.0, round(end / SAMPLE_RATE, 3))),
+                )
                 if frame.is_last:
                     self._streams.pop(stream.id, None)
-        for (stream, frame), text in zip(taken, texts, strict=True):
-            stream.deliver(text)
+            stream.deliver(delta)
             if frame.is_last:
                 stream.deliver(None)
 

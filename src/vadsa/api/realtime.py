@@ -108,7 +108,7 @@ async def _run(
     Plain asyncio.wait rather than a TaskGroup or gather: those can replace or swallow the
     CancelledError of a session that is being cancelled."""
     receiver = asyncio.create_task(_receive(websocket, scheduler, stream, settings))
-    sender = asyncio.create_task(_send_text(websocket, events))
+    sender = asyncio.create_task(_send_text(websocket, events, stream))
     try:
         # the receiver only ever ends with an error, the sender once the text is out
         await asyncio.wait((receiver, sender), return_when=asyncio.FIRST_COMPLETED)
@@ -190,18 +190,34 @@ async def _receive(
                 raise SessionEnd(1008, "unknown_event", f"Unknown event type: {other}")
 
 
-async def _send_text(websocket: WebSocket, events: asyncio.Queue[StreamEvent]) -> None:
+async def _send_text(
+    websocket: WebSocket, events: asyncio.Queue[StreamEvent], stream: Stream
+) -> None:
     """Send each piece of committed text as a delta, then the whole text as done."""
     text = ""
     while (event := await events.get()) is not None:
         if isinstance(event, BaseException):
             raise SessionEnd(1011, "internal_error", "Transcription failed.") from event
         # the transcript starts without the word separator the model puts first
-        delta = event if text else event.lstrip()
+        delta = event.text if text else event.text.lstrip()
         if delta:
             text += delta
-            await websocket.send_json({"type": "transcription.delta", "delta": delta})
-    await websocket.send_json({"type": "transcription.done", "text": text, "usage": None})
+            await websocket.send_json(
+                {
+                    "type": "transcription.delta",
+                    "delta": delta,
+                    "audio_start": event.audio_start,
+                    "audio_end": event.audio_end,
+                }
+            )
+    await websocket.send_json(
+        {
+            "type": "transcription.done",
+            "text": text,
+            "usage": None,
+            "audio_seconds": stream.received_samples / SAMPLE_RATE,
+        }
+    )
 
 
 def _parse(text: str | None) -> dict[str, Any]:

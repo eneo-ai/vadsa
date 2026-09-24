@@ -96,7 +96,10 @@ Errors have the OpenAI shape, `{"error": {"message", "type", "param", "code"}}`:
 `GET /v1/realtime` takes base64 PCM16 audio at 16 kHz in `input_audio_buffer.append` events
 and sends `transcription.delta` events while the audio is decoded, then `transcription.done`
 after the client's final commit, and closes. The event shapes are vLLM's, so vLLM clients
-such as Eneo's live preview work unchanged. Deltas only ever append. The text trails speech by
+such as Eneo's live preview work unchanged. Deltas only ever append and include
+`audio_start`/`audio_end` in seconds of submitted audio; `transcription.done` includes
+`audio_seconds` for coverage. The times describe step windows, not individual words, and
+each new session starts at 0. The text trails speech by
 about two seconds of model buffering, plus the time each step waits for the GPU and takes to
 run. It is a preview: the transcription endpoint sees the whole recording and gives the better
 transcript. Every refusal (a wrong key or model, too many sessions, a client sending audio

@@ -181,10 +181,15 @@ def test_a_session_streams_deltas_then_done_in_vllm_shapes(client: TestClient) -
     assert re.fullmatch(r"sess-[0-9a-f]{32}", created["id"])
     assert abs(created["created"] - time.time()) < 60
     assert events == [
-        {"type": "transcription.delta", "delta": "ord0"},
-        {"type": "transcription.delta", "delta": " ord1"},
-        {"type": "transcription.delta", "delta": " ord2"},
-        {"type": "transcription.done", "text": "ord0 ord1 ord2", "usage": None},
+        {"type": "transcription.delta", "delta": "ord0", "audio_start": 0.0, "audio_end": 0.0},
+        {"type": "transcription.delta", "delta": " ord1", "audio_start": 0.0, "audio_end": 1.0},
+        {"type": "transcription.delta", "delta": " ord2", "audio_start": 1.0, "audio_end": 2.5},
+        {
+            "type": "transcription.done",
+            "text": "ord0 ord1 ord2",
+            "usage": None,
+            "audio_seconds": 2.5,
+        },
     ]
     assert closed.value.code == 1000
 
@@ -193,7 +198,77 @@ def test_a_final_commit_without_audio_is_done_with_no_text(client: TestClient) -
     with client.websocket_connect(PATH, headers=AUTH) as ws:
         start(ws)
         ws.send_json({"type": "input_audio_buffer.commit", "final": True})
-        assert until_done(ws) == [{"type": "transcription.done", "text": "", "usage": None}]
+        assert until_done(ws) == [
+            {"type": "transcription.done", "text": "", "usage": None, "audio_seconds": 0.0}
+        ]
+
+
+@pytest.mark.parametrize(
+    ("seconds", "silent", "expected"),
+    [
+        (0.2, None, [("ord0", 0.0, 0.2)]),
+        (0.54, None, [("ord0", 0.0, 0.54)]),
+        (2.62, None, [("ord0", 0.0, 0.0), (" ord1", 0.0, 0.54), (" ord2", 0.54, 2.62)]),
+        (
+            4.0,
+            (0.54, 1.58),
+            [
+                ("ord0", 0.0, 0.0),
+                (" ord2", 0.54, 1.58),
+                (" ord3", 1.58, 2.62),
+                (" ord4", 2.62, 4.0),
+            ],
+        ),
+    ],
+    ids=["short", "exact-frame", "exact-multiple", "silent-step"],
+)
+def test_deltas_cover_their_steps_on_the_submitted_audio_clock(
+    seconds: float,
+    silent: tuple[float, float] | None,
+    expected: list[tuple[str, float, float]],
+) -> None:
+    engine = FakeEngine(frame_samples=16640)
+    engine.lead_in_samples = 8000
+    with serve(engine) as client:
+        for _ in range(2):  # reconnecting starts a new clock
+            with client.websocket_connect(PATH, headers=AUTH) as ws:
+                start(ws)
+                samples = speech(seconds, silent=silent)
+                append(ws, np.zeros(0, np.float32))
+                for offset in range(0, len(samples), 1600):
+                    append(ws, samples[offset : offset + 1600])
+                ws.send_json({"type": "input_audio_buffer.commit", "final": True})
+                deltas = until_done(ws)[:-1]
+            assert [(d["delta"], d["audio_start"], d["audio_end"]) for d in deltas] == expected
+            starts = [d["audio_start"] for d in deltas]
+            ends = [d["audio_end"] for d in deltas]
+            assert starts == sorted(starts) and ends == sorted(ends)
+            assert all(
+                isinstance(d["audio_start"], float)
+                and isinstance(d["audio_end"], float)
+                and 0 <= d["audio_start"] <= d["audio_end"] <= seconds
+                for d in deltas
+            )
+            assert ends[-1] == seconds
+
+
+@pytest.mark.parametrize("sample_count", [0, 16001])
+@pytest.mark.parametrize("silent", [False, True])
+def test_done_reports_received_samples_without_lead_in(sample_count: int, silent: bool) -> None:
+    engine = FakeEngine(frame_samples=16640)
+    engine.lead_in_samples = 8000
+    samples = np.full(sample_count, 0.0 if silent else 0.5, np.float32)
+    with serve(engine) as client, client.websocket_connect(PATH, headers=AUTH) as ws:
+        start(ws)
+        append(ws, samples[:8000])
+        append(ws, samples[8000:])
+        ws.send_json({"type": "input_audio_buffer.commit", "final": True})
+        events = until_done(ws)
+    assert events[-1]["audio_seconds"] == sample_count / 16000
+    if silent or not sample_count:
+        assert len(events) == 1 and events[-1]["text"] == ""
+    else:
+        assert events[-2]["audio_end"] == sample_count / 16000
 
 
 def test_a_wrong_key_is_refused_before_the_session(client: TestClient) -> None:
@@ -238,7 +313,12 @@ def test_a_session_open_longer_than_its_audio_limit_still_finishes() -> None:
         time.sleep(1.2)
         append(ws, speech(0.4))
         ws.send_json({"type": "input_audio_buffer.commit", "final": True})
-        assert until_done(ws)[-1] == {"type": "transcription.done", "text": "ord0", "usage": None}
+        assert until_done(ws)[-1] == {
+            "type": "transcription.done",
+            "text": "ord0",
+            "usage": None,
+            "audio_seconds": 0.8,
+        }
 
 
 def test_audio_past_the_session_limit_is_refused() -> None:
@@ -271,7 +351,12 @@ def test_the_final_text_gets_its_own_time_after_the_final_commit(limits: dict[st
         wait_until(lambda: engine.calls)
         time.sleep(0.8)
         engine.gate.set()
-        assert until_done(ws)[-1] == {"type": "transcription.done", "text": "ord0", "usage": None}
+        assert until_done(ws)[-1] == {
+            "type": "transcription.done",
+            "text": "ord0",
+            "usage": None,
+            "audio_seconds": 0.3,
+        }
 
 
 def test_a_session_that_never_finishes_ends_at_the_wall_clock_backstop() -> None:
@@ -360,6 +445,11 @@ def test_a_disconnect_clears_the_stream_state() -> None:
         with client.websocket_connect(PATH, headers=AUTH) as ws:
             start(ws)
             append(ws, speech(1.5))
-            assert ws.receive_json() == {"type": "transcription.delta", "delta": "ord0"}
+            assert ws.receive_json() == {
+                "type": "transcription.delta",
+                "delta": "ord0",
+                "audio_start": 0.0,
+                "audio_end": 0.0,
+            }
             assert engine.streams
         wait_until(lambda: not engine.streams)
