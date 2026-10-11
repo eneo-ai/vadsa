@@ -5,6 +5,8 @@ the NeMo checkpoint [KlangAI/pianissimo-sv](https://huggingface.co/KlangAI/piani
 an NVIDIA GPU. It is a stateless model server that presents itself like a vLLM speech server:
 an OpenAI-compatible transcription endpoint, a model list and vLLM's realtime WebSocket.
 
+To get vadsa running and connected to Eneo, follow the [quick start](docs/quickstart.md).
+
 [Vemsa](https://github.com/eneo-ai/vemsa) (*"vem sa?"*, "who said?") is the transcription
 and speaker-diarization pipeline; vadsa only turns speech into text. It keeps no jobs, files
 or database, and it does no diarization or alignment. Eneo registers vadsa as a vLLM
@@ -210,9 +212,10 @@ far live text can fall behind while a long file is transcribed.
    model listing reads `/v1/models`, where vadsa marks the model with
    `"model_type": "transcription"`.
 3. Tick "Livetranskribering" on the model to let flows show text while someone records.
-4. Live preview also needs Eneo's transcription service in mode `diarize`, or no
-   transcription service at all. In `full` mode Vemsa transcribes the recording itself, so
-   the final text would come from another model than the preview.
+
+A speaker identification service such as Vemsa does not affect live text. An administrator
+connects it in Eneo's admin interface, it only labels who spoke, and the flow's transcription
+model, here vadsa, still writes the text.
 
 Eneo sends transcription requests through LiteLLM's `hosted_vllm` provider, which posts
 OpenAI multipart to `{endpoint}/v1/audio/transcriptions`, and connects the live preview to
